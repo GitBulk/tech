@@ -128,6 +128,17 @@ WHERE "accounts"."user_id" = ?
 FOR UPDATE
 ```
 
+### So sánh Optimistic Locking:
+
+| Yếu tố                 | Pessimistic Locking               | Optimistic Locking                                |
+| ---------------------- | --------------------------------- | ------------------------------------------------- |
+| Nguy cơ race-condition | Không có                          | Có → cần retry                                    |
+| Số bước code           | 1 transaction                     | transaction + rescue + retry                      |
+| Hiệu năng              | Block request khác, nhưng ít → OK | Không block, nhưng nếu xung đột → retry nhiều lần |
+| Dễ hiểu / maintain     | Rất dễ                            | Phải handle StaleObjectError                      |
+| An toàn số dư          | 100%                              | Nếu không retry đúng → rủi ro                     |
+
+
 ---
 
 ## 8. Timeline hoạt động (rất quan trọng để hiểu)
