@@ -217,13 +217,128 @@ end
 
 ### ✦ Dùng `with_lock`:
 ```ruby
-account.with_lock do
-  ...
+class WithdrawService
+  def initialize(user_id, amount)
+    @user_id = user_id
+    @amount  = amount
+  end
+
+  def call
+    with_retry(max: 3) do
+      Account.transaction do
+        # with_lock = SELECT ... FOR UPDATE
+        account = Account.find_by!(user_id: @user_id)
+
+        account.with_lock do
+          raise "Not enough balance" if account.balance < @amount
+          account.update!(balance: account.balance - @amount)
+        end
+      end
+    end
+  end
+
+  private
+
+  # retry deadlock
+  def with_retry(max:)
+    retries = 0
+    begin
+      yield
+    rescue ActiveRecord::Deadlocked => e
+      retries += 1
+      if retries <= max
+        sleep(0.1)
+        retry
+      else
+        Rails.logger.error("[Deadlock] withdraw failed for user #{@user_id}: #{e.message}")
+        raise
+      end
+    end
+  end
 end
 ```
+#### So sánh với Class.lock.find ...
+
+| Feature             | `Account.lock.find_by!`    | `account.with_lock`             |
+| ------------------- | -------------------------- | ------------------------------- |
+| Lock row            | Khi query                  | Khi block bắt đầu               |
+| Transaction         | Cần tự wrap                | Có thể wrap hoặc dùng bên ngoài |
+| Khi dùng object sẵn | Không tiện, phải query lại | Dễ dùng với object đã load      |
+| Code style          | Dài hơn nếu đã có object   | Block syntax gọn, dễ đọc        |
+
+
+#### Account.lock.find_by!(user_id: user_id)
+```ruby
+account = Account.lock.find_by!(user_id: user_id)
+account.update!(balance: account.balance - amount)
+Account.lock → Rails sẽ generate:
+```
+
+```sql
+SELECT * FROM accounts WHERE user_id = ? FOR UPDATE
+Lock ngay khi query
+```
+Bạn thao tác update ngoài transaction → phải wrap trong Account.transaction, thường dùng trong service object / job
+
+#### account.with_lock do ... end
+```ruby
+account = Account.find_by!(user_id: user_id)
+account.with_lock do
+  account.update!(balance: account.balance - amount)
+end
+```
+with_lock sẽ tạo transaction và lock row ngay trước khi chạy block.
+
+Block code đảm bảo:
+- Row đã bị lock
+- Chỉ một session thao tác trên row đó
+
+Hữu ích khi bạn đã có object account và muốn lock trước khi update
+
 
 ### ✦ Dùng advisory lock khi lock theo logic, không phải row
-
+#### PostgreSQL cho phép bạn gọi pg_advisory_lock(key) để khóa một integer hoặc bigint key.
+```ruby
+class AdvisoryLockHelper
+  # namespace: integer để phân loại resource
+  # key: integer đại diện cho object
+  def self.with_advisory_lock(namespace, key)
+    # Lock
+    ActiveRecord::Base.connection.execute("SELECT pg_advisory_lock(#{namespace}, #{key})")
+    begin
+      yield
+    ensure
+      ActiveRecord::Base.connection.execute("SELECT pg_advisory_unlock(#{namespace}, #{key})")
+    end
+  end
+end
+```
+```ruby
+module AdvisoryLockNamespace
+  ACCOUNTS   = 1
+  INVENTORY  = 2
+  ORDERS     = 3
+  PAYOUTS    = 4
+end
+```
+#### Withdraw
+```ruby
+AdvisoryLockHelper.with_advisory_lock(AdvisoryLockNamespace::ACCOUNTS, user_id) do
+  Account.transaction do
+    account = Account.find_by!(user_id: user_id)
+    # logic withdraw
+  end
+end
+```
+#### Inventory update
+```ruby
+AdvisoryLockHelper.with_advisory_lock(AdvisoryLockNamespace::INVENTORY, product_id) do
+  Product.transaction do
+    product = Product.find(product_id)
+    # logic update stock
+  end
+end
+```
 ---
 
 ## 11. Kết luận
