@@ -181,16 +181,38 @@ Hầu hết startup lớn đều cần case này.
 
 ### ✦ Auto retry khi deadlock:
 ```ruby
-def with_retry(max = 3)
-  retries = 0
-  begin
-    yield
-  rescue ActiveRecord::Deadlocked
-    retries += 1
-    retry if retries < max
-    raise
+module SidekiqHelper
+  def self.with_db_retry(max: 3, sleep_time: 0.1)
+    retries = 0
+    begin
+      yield
+    rescue ActiveRecord::Deadlocked => e
+      retries += 1
+      if retries <= max
+        sleep(sleep_time) if sleep_time > 0
+        retry
+      else
+        Rails.logger.error("[DB Deadlock] Retry limit reached: #{e.message}")
+        raise e
+      end
+    end
   end
 end
+
+class WithdrawJob
+  include Sidekiq::Worker
+
+  def perform(user_id, amount)
+    SidekiqHelper.with_db_retry(max: 3, sleep_time: 0.2) do
+      Account.transaction do
+        account = Account.lock.find_by!(user_id: user_id)
+        raise "Not enough balance" if account.balance < amount
+        account.update!(balance: account.balance - amount)
+      end
+    end
+  end
+end
+
 ```
 
 ### ✦ Dùng `with_lock`:
