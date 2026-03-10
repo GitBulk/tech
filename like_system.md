@@ -1,10 +1,16 @@
-# Like System Notes -- v1
+# Like System Notes -- v1.1
 
 ## Scope
 
 - Hệ thống hiện đại, vừa phải (không lớn như facebook, twitter)
 - Mục tiêu: bảo đảm chính xác, atomicity, hiệu suất hợp lý.
 - PostgreSQL + Rails.
+
+## History
+
+v1.1 adds:
+-   Race condition timelines
+-   Code review checklist for Like systems
 
 ------------------------------------------------------------------------
 
@@ -96,8 +102,51 @@ Kết quả:
 ```
 
 ------------------------------------------------------------------------
+# 4. Race Condition Timelines
+## Case 1: Two LIKE requests simultaneously
 
-# 4. Vì sao không nên xử lý logic trong application code bằng 2 queries?
+Initial: likes_count = 0
+
+Timeline:
+- T1: INSERT like → success
+- T2: INSERT like → conflict (unique index)
+
+Kết quả:
+- likes_count = 1
+- likes table = 1 row
+- Correct.
+
+------------------------------------------------------------------------
+## Case 2: LIKE retry
+
+Initial: likes_count = 0
+
+Timeline:
+- T1: request sent
+- T2: network retry
+- T3: request retried
+
+Flow:
+
+- first request → insert +1
+- second request → conflict → no update
+
+Kết quả: likes_count = 1
+
+------------------------------------------------------------------------
+## Case 3: Two UNLIKE requests simultaneously
+
+Initial: likes_count = 1
+
+Timeline:
+- T1 delete like → success
+- T2 delete like → 0 rows
+
+Kết quả: likes_count = 0
+
+------------------------------------------------------------------------
+
+# 5. Vì sao không nên xử lý logic trong application code bằng 2 queries?
 
 Example pattern:
 
@@ -120,7 +169,7 @@ Atomic SQL tránh được các lỗi trên.
 
 ------------------------------------------------------------------------
 
-# 5. PostgreSQL Parameter Binding
+# 6. PostgreSQL Parameter Binding
 
 In PostgreSQL:
 
@@ -146,7 +195,7 @@ sanitize_sql_array([sql, user.id, post.id])
 
 ------------------------------------------------------------------------
 
-# 6. Primary DB vs Read Replica
+# 7. Primary DB vs Read Replica
 
 Like/Unlike should run on **primary DB** because:
 
@@ -171,7 +220,7 @@ end
 
 ------------------------------------------------------------------------
 
-# 7. DELETE vs TRUNCATE (Important)
+# 8. DELETE vs TRUNCATE (Important)
 
 ## DELETE ... RETURNING
 
@@ -211,17 +260,39 @@ Kết luận:
 ```
 
 ------------------------------------------------------------------------
-
-# 8. Current Recommended Approach (v1)
-
+# 9. Code Review Checklist (Like System)
 For a moderate-scale system:
+When reviewing a Like system, check:
+
+### Database
+1.  Use unique constraint on `(user_id, post_id)`
+-   [ ] Unique constraint on (user_id, post_id)
+-   [ ] likes_count default 0
+-   [ ] likes_count NOT NULL
+### API correctness
+-   [ ] LIKE is idempotent
+-   [ ] UNLIKE is idempotent
+-   [ ] Retry safe
+### SQL design
+-   [ ] Avoid read-modify-write pattern
+-   [ ] Prefer atomic SQL
+-   [ ] Avoid two-step operations when possible
+### Infrastructure
+-   [ ] Writes go to primary DB
+-   [ ] Replica lag considered
+
+------------------------------------------------------------------------
+
+# 10. Current Recommended Approach (v1)
+
+Đối với hệ thống vừa phải:
 
 1.  Dùng unique index `(user_id, post_id)`
 2.  Dùng atomic SQL cho like/unlike
 3.  Duy trì `posts.likes_count`
 4.  Thực hiện việc ghi và primary DB
 
-Lơi ích:
+Lợi ích:
 
 -   Correctness
 -   Idempotent API
