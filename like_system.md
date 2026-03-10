@@ -553,10 +553,105 @@ ALTER COLUMN likes_count SET DEFAULT 0;
 ALTER TABLE posts
 ALTER COLUMN likes_count SET NOT NULL;
 ```
+**Bước 1: Khai báo Constraint (Lệnh này chạy tức thì)**
+```sql
+ALTER TABLE posts
+ADD CONSTRAINT posts_likes_count_not_null
+CHECK (likes_count IS NOT NULL) NOT VALID;
+```
+
+**Lưu ý:** NOT VALID giúp Postgres bỏ qua việc kiểm tra 10 triệu dòng cũ, chỉ áp dụng cho các dòng mới từ giây phút này.
+
+**Bước 2: Xác thực dữ liệu cũ (Chạy ngầm)**
+
+```sql
+ALTER TABLE posts
+VALIDATE CONSTRAINT posts_likes_count_not_null;
+```
+
+**Đặc điểm:** Lệnh này quét bảng nhưng không lock việc đọc/ghi. Nếu phát hiện dòng nào NULL, nó sẽ báo lỗi. Lúc này bạn chỉ cần chạy Audit/Fix rồi chạy lại lệnh này.
+
+**Chiến lược Audit:**
+
+`Tầng 1. Quick Check:`
+
+Trước khi đi vào chi tiết, ta kiểm tra tổng số lượng trên toàn hệ thống. Nếu hai con số này lệch nhau, chắc chắn có bước nào đó trong quá trình migrate bị lỗi.
+
+```sql
+SELECT
+    (SELECT SUM(likes_count) FROM posts) AS total_counter,
+    (SELECT COUNT(*) FROM likes) AS total_actual_records;
+```
+
+
+`Tầng 2: Tìm bài post bị lệch (Deep Audit)`
+
+Nếu tầng 1 có lệch, hoặc muốn chắc chắn 100%, hãy dùng câu query này để "chỉ mặt đặt tên" những bài post đang có dữ liệu sai.
+
+Lưu ý: Query này quét toàn bộ 10 triệu dòng nên chỉ chạy vào giờ thấp điểm (Off-peak hours).
+
+```sql
+SELECT p.id, p.likes_count, sub.actual_cnt
+FROM posts p
+JOIN (
+    SELECT post_id, COUNT(*) AS actual_cnt
+    FROM likes
+    GROUP BY post_id
+) sub ON p.id = sub.post_id
+WHERE p.likes_count != sub.actual_cnt
+LIMIT 100; -- Xem trước 100 dòng lỗi đầu tiên
+```
+
+`Tầng 3: Tự động sửa lỗi (Auto-Healing)`
+
+Nếu phát hiện có sai lệch (thường do Race Condition cực hiếm hoặc lỗi logic trong script backfill), chúng ta dùng lệnh UPDATE kết hợp JOIN để đồng bộ lại dữ liệu chuẩn từ bảng likes sang posts.
+
+```sql
+-- Chỉ cập nhật những dòng bị lệch để tiết kiệm IO
+UPDATE posts p
+SET likes_count = sub.actual_cnt
+FROM (
+    SELECT post_id, COUNT(*) AS actual_cnt
+    FROM likes
+    GROUP BY post_id
+) sub
+WHERE p.id = sub.post_id
+  AND p.likes_count != sub.actual_cnt;
+```
+
+`Mindset`
+```
+Dữ liệu là tài sản, và trong một hệ thống lớn, 'hy vọng' không phải là một chiến lược quản lý rủi ro tốt. Audit là cách để chúng ta biến 'hy vọng' thành 'sự thật'.
+```
+
+`Vacuum & Analyze:`
+
+Mục đích để Postgres cập nhật lại bảng thống kê (statistics), giúp Query Planner hoạt động chính xác nhất sau khi thay đổi 10 triệu dòng.
+
+```sql
+-- 1. Cập nhật thống kê trước (Rất nhanh, cực kỳ an toàn)
+ANALYZE posts;
+
+-- 2. Dọn dẹp rác sau (Chạy lúc thấp điểm để tránh tốn IO)
+VACUUM posts;
+```
 
 Lúc này:
 ```
 sau khi backfill xong + replay hết delta, thì likes_count đã trở thành nguồn dữ liệu chính xác và đáng tin cậy.
+```
+
+### Timeline Visualization
+```
+ADD nullable COLUMN
+    ↓
+BACKFILL DATA
+    ↓
+ADD CHECK NOT VALID
+    ↓
+VALIDATE CONSTRAINT  (online table scan)
+    ↓
+SET NOT NULL         (instant)
 ```
 
 ## 12. Online Migration Timeline
@@ -587,6 +682,7 @@ Lock schema constraints
 - **v1.0:**  Basic counter design
 - **v1.1:**  Race condition analysis
 - **v1.2:**  Counter migration for existing system
+- **v1.3:**  Online NOT NULL migration pattern
 - **v2**: Handling higher traffic (counter contention)
 - **v3**: Delta tables / batch aggregation
 - **v4**: Distributed counters / caching
