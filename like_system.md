@@ -490,6 +490,60 @@ Worker sẽ chạy:
 - giảm load DB
 - dễ kiểm soát
 
+Khuyết điểm:
+- Vẫn có thể gây slow query nếu một post_id có quá nhiều likes
+
+Cách khác:
+- Thay vì chạy một lệnh SQL khổng lồ GROUP BY post_id trên toàn bộ 10 triệu dòng (gây treo DB), chúng ta dùng ID của chính bảng likes làm "con trỏ" (cursor) để kiểm soát khối lượng công việc.
+- Cách làm: Chia 10 triệu dòng likes thành các đoạn dựa trên ID (ví dụ: đợt 1 xử lý likes từ ID 1 đến 100.000). Với mỗi đoạn, ta tìm ra danh sách các post_id xuất hiện trong đó. Cập nhật cộng dồn vào bảng posts.
+- Giải pháp cho vấn đề "Dữ liệu bị chia cắt", để tránh việc post_id = X bị đếm thiếu do nằm ở nhiều batch, chúng ta không dùng SET likes_count = count, mà dùng Atomic Addition (Cộng dồn nguyên tử).
+- Script SQL cho Worker (Chạy theo lô ID của bảng likes):
+
+```sql
+-- Giả sử xử lý lô likes có ID từ 1.000.000 đến 1.050.000
+UPDATE posts p
+SET likes_count = COALESCE(p.likes_count, 0) + sub.batch_cnt
+FROM (
+  SELECT post_id, COUNT(*) as batch_cnt
+   sentiments
+  FROM likes
+  WHERE id >= 1000000 AND id < 1050000
+  GROUP BY post_id
+) sub
+WHERE p.id = sub.post_id;
+```
+
+- Tại sao cách này giải quyết được vấn đề chia cách dữ liệu ?
+    - Nếu post_id = X xuất hiện ở lô 1 (có 2 likes) và lô 2 (có 3 likes), lệnh `SET likes_count = likes_count + batch_cnt` sẽ giúp giá trị tăng dần: $0 \to 2 \to 5$.
+- Tốc độ: Việc lọc theo id (Primary Key) của bảng likes là thao tác nhanh nhất trong Postgres.
+- An toàn: Có thể dừng script bất cứ lúc nào và chạy tiếp từ ID đã dừng mà không sợ mất dữ liệu.
+- Sample ruby code:
+```ruby
+# Batch size cho bảng likes
+BATCH_SIZE = 50_000
+start_id = Like.minimum(:id)
+max_id = Like.maximum(:id)
+
+(start_id..max_id).step(BATCH_SIZE) do |current_id|
+  upper_id = current_id + BATCH_SIZE
+
+  # Thực hiện cộng dồn delta từ batch này vào bảng posts
+  ActiveRecord::Base.connection.execute(<<-SQL)
+    UPDATE posts p
+    SET likes_count = COALESCE(p.likes_count, 0) + sub.cnt
+    FROM (
+      SELECT post_id, COUNT(*) as cnt
+      FROM likes
+      WHERE id >= #{current_id} AND id < #{upper_id}
+      GROUP BY post_id
+    ) sub
+    WHERE p.id = sub.post_id
+  SQL
+
+  puts "Processed likes up to ID: #{upper_id}"
+  sleep(0.05) # Giảm áp lực IO cho Disk
+end
+```
 
 ## 9. Vấn đề lớn nhất: Concurrent Writes
 
@@ -754,6 +808,7 @@ Lock schema constraints
 - **v1.2:**  Counter migration for existing system
 - **v1.3:**  Online NOT NULL migration pattern
 - **v1.4:**  Support Postgres >= 11
+- **v1.5:**  Update migration
 - **v2**: Handling higher traffic (counter contention)
 - **v3**: Delta tables / batch aggregation
 - **v4**: Distributed counters / caching
