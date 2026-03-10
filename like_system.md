@@ -772,6 +772,33 @@ WHERE p.id = sub.post_id
   AND p.likes_count != sub.actual_cnt;
 ```
 
+`Cân nhắc Set statement_timeout`
+
+Khi chạy script Audit 10 triệu dòng từ Rails console, ta có thể thiết lập timeout ngay trong connection đó
+
+
+Kiểm tra timeout hiện tại:
+```
+ActiveRecord::Base.connection.execute("SHOW statement_timeout").values
+```
+Hoặc
+```sql
+SHOW statement_timeout
+```
+
+Kết quả thường sẽ trả về dạng 30s, 1min hoặc 0 (nghĩa là không giới hạn).
+
+Thực hiện chạy audit:
+
+```ruby
+# Điều này đảm bảo nếu query quét quá nặng, nó sẽ tự ngắt thay vì làm treo các tiến trình khác.
+ActiveRecord::Base.connection.execute("SET statement_timeout = '30s'")
+# Chạy query Audit nặng ở đây
+results = ActiveRecord::Base.connection.execute("SELECT ... GROUP BY post_id ...")
+# Sau khi xong, nên reset lại về mặc định (thường là 0 - không giới hạn)
+ActiveRecord::Base.connection.execute("SET statement_timeout = 0")
+```
+
 `Mindset`
 ```
 Dữ liệu là tài sản, và trong một hệ thống lớn, 'hy vọng' không phải là một chiến lược quản lý rủi ro tốt. Audit là cách để chúng ta biến 'hy vọng' thành 'sự thật'.
