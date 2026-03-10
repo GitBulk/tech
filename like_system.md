@@ -6,15 +6,6 @@
 - Mục tiêu: bảo đảm chính xác, atomicity, hiệu suất hợp lý.
 - PostgreSQL + Rails.
 
-## History
-
-v1.1:
-- Race condition timelines
-- Code review checklist for Like systems
-
-v1.2:
-- Backfill data sau khi hệ thống đã chạy một thời gian
-
 ------------------------------------------------------------------------
 
 # 1. Basic Like / Unlike Model
@@ -379,17 +370,49 @@ Nhưng database lưu: 10
 Ngoài ra: Logic migrate phải giữ mãi trong code.
 
 ## 4. Eager Migration Strategy
-
-Chiến lược phổ biến trong production.
-
 Các bước:
   1. Add column nullable
   2. Deploy code support likes_count
   3. Backfill data
-  4. Lock schema
+  4. Validate, Lock schema, drop constraint, ...
 
+`Note:`
+- Postgres < 11, thêm 1 column có giá trị default thì Postgres sẽ phải viết lại toàn bộ bảng để chèn giá trị 0 vào từng dòng. Việc này sẽ giữ một lệnh ACCESS EXCLUSIVE LOCK, ngăn chặn mọi thao tác đọc/ghi vào bảng posts cho đến khi hoàn tất, gây ra downtime nghiêm trọng.
+- Postgres >= 11 đã optimize việc thêm column với giá trị default nên chiến lược làm sẽ khác một chút, đó là `không cần làm 4. Validate, Lock schema, drop constraint, ...` nhưng `vẫn cần làm 3. Backfill data`
+
+`Postgres >= 11`
+- Từ Postgres 11, khi thêm một cột có giá trị mặc định (DEFAULT), Postgres không còn quét toàn bộ bảng để ghi giá trị đó xuống đĩa cứng ngay lập tức. Thay vào đó, nó lưu giá trị mặc định vào bảng hệ thống (pg_attribute).
+- Khi SELECT một dòng cũ, Postgres sẽ tự động chèn giá trị mặc định này vào kết quả trả về.
+- Chỉ khi dòng đó được UPDATE, giá trị mới thực sự được ghi xuống đĩa.
+- DEFAULT value phải là non-volatile expression:
+```
+DEFAULT 0
+DEFAULT false
+DEFAULT 'active'
+```
+- Không OK:
+```
+DEFAULT now()
+DEFAULT gen_random_uuid()
+DEFAULT random()
+-> table rewrite
+```
+- Lệnh thực thi an toàn:
+```sql
+-- Chạy tức thì (instant) dù bảng có 10M hay 100M dòng
+ALTER TABLE posts 
+ADD COLUMN likes_count INTEGER NOT NULL DEFAULT 0;
+```
+So sánh:
+```
+Đặc điểm	 Postgres < 11	                    Postgres >= 11
+-----------  ---------------------------------  -----------------------------------
+Add Column	 Phải add NULL trước	            Có thể add NOT NULL DEFAULT 0 ngay
+Thời gian    Lock	Rất lâu (nếu dùng Default)	Tức thì (O(1))
+Độ an toàn	 Cần chia nhỏ nhiều bước	        Rất cao, ít rủi ro lock schema
+```
 ## 5. Step 1 — Add Column (Nullable)
-Không nên làm ngay: likes_count INTEGER NOT NULL DEFAULT 0
+Không nên làm ngay việc thêm column likes_count INTEGER NOT NULL DEFAULT 0
 vì **PostgreSQL có thể Table Rewrite (Viết lại toàn bảng)**
 → cực kỳ nặng nếu bảng lớn.
 
@@ -536,7 +559,6 @@ UPDATE posts
 SET likes_count = likes_count + delta
 ```
 
-
 ## 11. Finalization
 
 Sau khi:
@@ -553,6 +575,11 @@ ALTER COLUMN likes_count SET DEFAULT 0;
 ALTER TABLE posts
 ALTER COLUMN likes_count SET NOT NULL;
 ```
+
+**Note:**
+Việc Alter table để set not null có thể gây chậm với các version Postgres cũ. Thay vì cố gắng dùng SET NOT NULL, chúng ta có thể sẽ dừng lại ở Check Constraint.
+
+### Use Postgres < 12
 **Bước 1: Khai báo Constraint (Lệnh này chạy tức thì)**
 ```sql
 ALTER TABLE posts
@@ -635,6 +662,33 @@ ANALYZE posts;
 -- 2. Dọn dẹp rác sau (Chạy lúc thấp điểm để tránh tốn IO)
 VACUUM posts;
 ```
+**Bước 3: Quyết định về SET NOT NULL**
+
+- Với hệ thống chạy Postgres cũ (vd: version 9.5): Dừng lại ở đây. Không chạy ALTER COLUMN SET NOT NULL. Vì lệnh này không nhận diện được VALIDATED CHECK CONSTRAINT và sẽ quét bảng lại từ đầu dưới lệnh khóa nặng, gây gián đoạn hệ thống
+
+- Từ Postgres >= 12. Nếu đã tồn tại valid CHECK constraint chứng minh column không thể NULL, PostgreSQL bỏ qua table scan khi SET NOT NULL. Thực ra từ Postgres >= 11 thì việc thêm column có default value đã dễ dàng hơn rất nhiều.
+
+
+### Use Postgres >= 12
+**Bước 4 — Convert to NOT NULL**
+
+Sau khi constraint đã validate:
+```sql
+ALTER TABLE posts
+ALTER COLUMN likes_count SET NOT NULL;
+```
+
+Vì PostgreSQL đã biết: `likes_count IS NOT NULL` nên bước này chỉ `update metadata` và không cần scan table nữa.
+
+**Bước 5 — Remove Temporary Constraint (Optional)**
+
+Sau khi column đã NOT NULL:
+```sql
+ALTER TABLE posts
+DROP CONSTRAINT posts_likes_count_not_null;
+```
+
+Constraint này không còn cần thiết.
 
 Lúc này:
 ```
@@ -652,6 +706,22 @@ ADD CHECK NOT VALID
 VALIDATE CONSTRAINT  (online table scan)
     ↓
 SET NOT NULL         (instant)
+```
+
+`[Postgres >= 11]`
+```
+ALTER TABLE ADD COLUMN DEFAULT 0 NOT NULL (Instant)
+    ↓
+START RECORDING DELTAS (Redis/Table)
+    ↓
+BATCH BACKFILL (Atomic Update: count + delta)
+    ↓
+AUDIT & ANALYZE
+```
+
+`Mindset`
+```
+Hiểu về phiên bản Database đang dùng giúp chúng ta chọn được con đường ngắn nhất. Nhưng dù con đường có ngắn đến đâu, nguyên tắc 'Atomic' và 'Audit' vẫn là kim chỉ nam không được phép thay đổi
 ```
 
 ## 12. Online Migration Timeline
@@ -683,6 +753,7 @@ Lock schema constraints
 - **v1.1:**  Race condition analysis
 - **v1.2:**  Counter migration for existing system
 - **v1.3:**  Online NOT NULL migration pattern
+- **v1.4:**  Support Postgres >= 11
 - **v2**: Handling higher traffic (counter contention)
 - **v3**: Delta tables / batch aggregation
 - **v4**: Distributed counters / caching
