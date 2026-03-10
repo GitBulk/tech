@@ -1,4 +1,4 @@
-# Like System Notes -- v1.1
+# Like System Notes -- v1.6
 
 ## Scope
 
@@ -613,6 +613,78 @@ UPDATE posts
 SET likes_count = likes_count + delta
 ```
 
+**Idempotent Delta Buffer:**
+
+Khi "replay" dữ liệu từ Delta Buffer (Redis hoặc Delta Table) vào bảng chính, chúng ta cần đảm bảo: Mỗi Delta chỉ được cộng một lần duy nhất.
+
+1\. Problem
+
+Khi dùng Delta Buffer, flow thường là:
+```
+Like event
+   ↓
+delta buffer
+   ↓
+background worker
+   ↓
+UPDATE posts.likes_count
+```
+
+VD:
+```sql
+UPDATE posts
+SET likes_count = likes_count + 5
+WHERE id = 42;
+```
+
+Nhưng nếu worker bị retry, crash, replay job thì delta có thể bị apply nhiều lần. Kết quả là likes_count sai
+
+
+2\. Idempotency Principle
+
+Replay phải đảm bảo:
+- replay 1 lần = replay 100 lần
+- Kết quả không thay đổi.
+
+Đây gọi là: Idempotent Operation (Phép toán độc lập)
+
+3\. Strategy A — Delta Table + Offset Tracking
+
+Trên bảng posts, ta thêm một cột last_processed_delta_id.
+Khi Replay, ta chỉ lấy các delta có id > last_processed_delta_id.
+```sql
+UPDATE posts p
+SET likes_count = p.likes_count + sub.cnt,
+    last_processed_delta_id = sub.max_id
+FROM (
+    SELECT post_id, COUNT(*) as cnt, MAX(id) as max_id
+    FROM post_like_deltas
+    WHERE id > p.last_processed_delta_id
+    GROUP BY post_id
+) sub
+WHERE p.id = sub.post_id;
+```
+Lợi ích: Đây là cách làm Idempotent tuyệt đối. Dù Worker có crash và chạy lại 100 lần, nó vẫn chỉ lấy những dữ liệu mới hơn con số max_id đã lưu.
+
+4\. Strategy B — Redis Delta Buffer
+
+Nếu dùng Redis, vấn đề là lệnh GET để lấy delta rồi cập nhật vào DB, rồi SET 0 không atomic (có thể mất Like phát sinh ở giữa 2 lệnh).
+
+Giải pháp: Dùng lệnh GETSET hoặc Lua Script để lấy giá trị và reset về 0 trong một thao tác duy nhất.
+
+```ruby
+# Lua script để đảm bảo nguyên tử
+script = <<~LUA
+  local val = redis.call('get', KEYS[1])
+  redis.call('set', KEYS[1], 0)
+  return val
+LUA
+
+delta = redis.eval(script, keys: ["post_likes_buffer:#{post_id}"])
+# Sau đó cộng delta này vào Database
+```
+
+
 ## 11. Finalization
 
 Sau khi:
@@ -809,6 +881,7 @@ Lock schema constraints
 - **v1.3:**  Online NOT NULL migration pattern
 - **v1.4:**  Support Postgres >= 11
 - **v1.5:**  Update migration
+- **v1.6:**  Idempotent Delta Replay
 - **v2**: Handling higher traffic (counter contention)
 - **v3**: Delta tables / batch aggregation
 - **v4**: Distributed counters / caching
