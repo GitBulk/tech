@@ -8,9 +8,12 @@
 
 ## History
 
-v1.1 adds:
--   Race condition timelines
--   Code review checklist for Like systems
+v1.1:
+- Race condition timelines
+- Code review checklist for Like systems
+
+v1.2:
+- Backfill data sau khi hệ thống đã chạy một thời gian
 
 ------------------------------------------------------------------------
 
@@ -301,9 +304,290 @@ Lợi ích:
 
 ------------------------------------------------------------------------
 
-# Future Versions
+# 11. Counter Migration for Existing Systems
+--------------------------------------
 
--   **v2**: Handling higher traffic (counter contention)
--   **v3**: Delta tables / batch aggregation
--   **v4**: Distributed counters / caching
--   **v5**: Large-scale architecture (queues, sharded counters, etc.)
+Version **v1.2** giải quyết vấn đề:
+
+> Nếu hệ thống **đã chạy một thời gian** và bảng likes đã rất lớn (ví dụ **10M+ rows**) nhưng **chưa có column posts.likes_count**, thì migrate thế nào cho an toàn?
+
+Vấn đề lúc này không chỉ là:
+- Correctness (Tính đúng đắn)
+
+mà còn là:
+- Online Migration (Di chuyển dữ liệu khi hệ thống đang chạy)**
+- Race Condition (Điều kiện tranh chấp)**
+- Write Contention (Tranh chấp ghi)**
+
+## 1. Bối cảnh hệ thống
+
+Giả sử schema ban đầu:
+- posts (id)
+- likes(id, user_id, post_id)
+
+Sau một thời gian: likes table ≈ 10M rows
+
+Bây giờ ta muốn thêm: posts.likes_count
+
+Để tránh query:
+
+```sql
+SELECT COUNT(*)
+FROM likes
+WHERE post_id = ?
+```
+
+## 2. Hai chiến lược migrate
+
+Có hai hướng chính:
+  1. Delay Migration (Di chuyển trì hoãn), không migrate ngay, tính likes_count khi cần.
+  2. Eager Migration (Di chuyển ngay), Backfill toàn bộ likes_count.
+
+## 3. Delay Migration Strategy
+Ý tưởng: Chỉ khi hiển thị post mới tính likes_count. Sample code:
+```ruby
+def display_likes_count
+  if self[:likes_count].nil?
+    cnt = Like.where(post_id: id).count
+    update_column(:likes_count, cnt)
+    cnt
+  else
+    self[:likes_count]
+  end
+end
+```
+
+Ưu điểm
+- Không cần query migrate lớn
+- Không gây load database
+
+Nhược điểm
+- Race condition:
+- Timeline:
+```
+T1  SELECT COUNT(*) = 10
+T2  user LIKE
+T3  likes_count update = 10
+```
+
+Kết quả mong đợi: likes_count phải là 11
+
+Nhưng database lưu: 10
+
+Đây là: Lost Update (Mất cập nhật)
+
+Ngoài ra: Logic migrate phải giữ mãi trong code.
+
+## 4. Eager Migration Strategy
+
+Chiến lược phổ biến trong production.
+
+Các bước:
+  1. Add column nullable
+  2. Deploy code support likes_count
+  3. Backfill data
+  4. Lock schema
+
+## 5. Step 1 — Add Column (Nullable)
+Không nên làm ngay: likes_count INTEGER NOT NULL DEFAULT 0
+vì **PostgreSQL có thể Table Rewrite (Viết lại toàn bảng)**
+→ cực kỳ nặng nếu bảng lớn.
+
+Thay vào đó:
+```sql
+ALTER TABLE posts ADD COLUMN likes_count INTEGER;
+```
+
+## 6. Step 2 — Application Support
+
+Sau khi deploy code mới.
+
+Like:
+```sql
+UPDATE posts
+SET likes_count = COALESCE(likes_count,0) + 1
+WHERE id = ?
+```
+
+Unlike:
+```sql
+UPDATE posts
+SET likes_count = GREATEST(COALESCE(likes_count,0) - 1,0)
+WHERE id = ?
+```
+
+Điểm quan trọng:
+```sql
+COALESCE(likes_count,0)
+```
+vì giai đoạn này likes_count vẫn có thể là NULL.
+
+
+## 7. Step 3 — Backfill Existing Data
+
+Query naive:
+```qsql
+UPDATE posts p
+SET likes_count = sub.cnt
+FROM (
+  SELECT post_id, COUNT(*) cnt
+  FROM likes
+  GROUP BY post_id
+) sub
+WHERE p.id = sub.post_id;
+```
+Nếu **likes = 10M** rows thì query này -> scan toàn bảng -> cực nặng
+
+
+## 8. Batch Backfill Strategy
+
+Giải pháp: Batch Migration (Di chuyển theo lô)
+
+VD:
+```sql
+UPDATE posts p
+SET likes_count = sub.cnt
+FROM (
+  SELECT post_id, COUNT(*) cnt
+  FROM likes
+  WHERE post_id BETWEEN X AND Y
+  GROUP BY post_id
+) sub
+WHERE p.id = sub.post_id;
+```
+
+Worker sẽ chạy:
+```
+- 1 → 10000
+- 10001 → 20000
+...
+```
+
+Ưu điểm:
+- giảm load DB
+- dễ kiểm soát
+
+
+## 9. Vấn đề lớn nhất: Concurrent Writes
+
+Trong lúc backfill vẫn có user like/unlike.
+
+Ví dụ timeline:
+```
+Initial
+likes_count = NULL
+T1 backfill read COUNT(*) = 100
+T2 user LIKE
+T3 backfill write likes_count = 100
+```
+
+Giá trị mong đợi: 101
+
+Nhưng database lưu: 100
+
+Đây cũng là: **Lost Update (Mất cập nhật).**
+
+## 10. Production-Safe Pattern
+
+Giải pháp phổ biến: **Delta Buffer (Bộ đệm delta).**
+
+Ý tưởng:
+```
+Backfill snapshot
++
+Record realtime delta
+```
+
+Kiến trúc
+```
+likes table
+   ↓
+delta buffer
+   ↓
+likes_count column
+```
+
+Data phát sinh (delta) có thể lưu trong Redis hoặc table database
+
+**Dùng Redis để lưu buffer data**
+
+Key:
+```
+post_likes_buffer:{post_id}
+```
+
+User click LIKE:
+```
+INCR post_likes_buffer:123
+```
+
+Worker:
+```
+likes_count = likes_count + delta
+```
+
+**Dùng Delta Table**
+```
+post_like_deltas(post_id, delta)
+```
+Worker flush:
+```sql
+UPDATE posts
+SET likes_count = likes_count + delta
+```
+
+
+## 11. Finalization
+
+Sau khi:
+- backfill xong
+- replay delta xong
+
+ta mới lock schema:
+```sql
+ALTER TABLE posts
+ALTER COLUMN likes_count SET DEFAULT 0;
+```
+
+```sql
+ALTER TABLE posts
+ALTER COLUMN likes_count SET NOT NULL;
+```
+
+Lúc này:
+```
+sau khi backfill xong + replay hết delta, thì likes_count đã trở thành nguồn dữ liệu chính xác và đáng tin cậy.
+```
+
+## 12. Online Migration Timeline
+
+Production rollout:
+```
+Deploy code
+   ↓
+Add nullable column
+   ↓
+Start recording deltas
+   ↓
+Run batch backfill
+   ↓
+Replay deltas
+   ↓
+Lock schema constraints
+```
+
+Đảm bảo:
+- No Downtime (Không downtime)
+- No Lost Update (Không mất cập nhật)
+- Safe Migration (Di chuyển an toàn)
+
+
+------------------------------------------------------------------------
+# Roadmap:
+- **v1.0:**  Basic counter design
+- **v1.1:**  Race condition analysis
+- **v1.2:**  Counter migration for existing system
+- **v2**: Handling higher traffic (counter contention)
+- **v3**: Delta tables / batch aggregation
+- **v4**: Distributed counters / caching
+- **v5**: Large-scale architecture (queues, sharded counters, etc.)
