@@ -28,12 +28,11 @@ Version     Công nghệ chính     Giải quyết vấn đề               Quy
 
 # 1. Basic Like / Unlike Model
 
-## Tables
+Tables:
 
-**likes**
+1. likes(user_id, post_id)
 
--   user_id
--   post_id
+2. posts(id, likes_count (INTEGER NOT NULL DEFAULT 0))
 
 Index:
 
@@ -46,15 +45,6 @@ ON likes(user_id, post_id);
 
 -  1 user chỉ có thể like 1 bài post 1 lần
 -  Cho phép thực hiện các idempotent operations.
-
-------------------------------------------------------------------------
-
-**posts**
-
--   id
--   likes_count (INTEGER NOT NULL DEFAULT 0)
-
-------------------------------------------------------------------------
 
 # 2. Idempotent LIKE Operation
 
@@ -113,7 +103,6 @@ Kết quả:
   Retry request     no counter change
 ```
 
-------------------------------------------------------------------------
 # 4. Race Condition Timelines
 ## Case 1: Two LIKE requests simultaneously
 
@@ -128,7 +117,6 @@ Kết quả:
 - likes table = 1 row
 - Correct.
 
-------------------------------------------------------------------------
 ## Case 2: LIKE retry
 
 Initial: likes_count = 0
@@ -145,7 +133,6 @@ Flow:
 
 Kết quả: likes_count = 1
 
-------------------------------------------------------------------------
 ## Case 3: Two UNLIKE requests simultaneously
 
 Initial: likes_count = 1
@@ -156,7 +143,7 @@ Timeline:
 
 Kết quả: likes_count = 0
 
-------------------------------------------------------------------------
+
 
 # 5. Vì sao không nên xử lý logic trong application code bằng 2 queries?
 
@@ -423,11 +410,11 @@ ADD COLUMN likes_count INTEGER NOT NULL DEFAULT 0;
 ```
 So sánh:
 ```
-Đặc điểm	 Postgres < 11	                    Postgres >= 11
+Đặc điểm	   Postgres < 11	                    Postgres >= 11
 -----------  ---------------------------------  -----------------------------------
-Add Column	 Phải add NULL trước	            Có thể add NOT NULL DEFAULT 0 ngay
-Thời gian    Lock	Rất lâu (nếu dùng Default)	Tức thì (O(1))
-Độ an toàn	 Cần chia nhỏ nhiều bước	        Rất cao, ít rủi ro lock schema
+Add Column	 Phải add NULL trước	              Có thể add NOT NULL DEFAULT 0 ngay
+Thời gian    Lock	Rất lâu (nếu dùng Default)	  Tức thì (O(1))
+Độ an toàn	 Cần chia nhỏ nhiều bước	          Rất cao, ít rủi ro lock schema
 ```
 ## 5. Step 1 — Add Column (Nullable)
 Không nên làm ngay việc thêm column likes_count INTEGER NOT NULL DEFAULT 0
@@ -582,18 +569,18 @@ Nhưng database lưu: 100
 
 Đây cũng là: **Lost Update (Mất cập nhật).**
 
-## 10. Production-Safe Pattern
+# 10. Production-Safe Pattern, Delta Buffer
 
 Giải pháp phổ biến: **Delta Buffer (Bộ đệm delta).**
 
-Ý tưởng:
+## 10.1. Ý tưởng
 ```
 Backfill snapshot
 +
 Record realtime delta
 ```
 
-Kiến trúc
+## 10.2. Kiến trúc
 ```
 likes table
    ↓
@@ -602,9 +589,11 @@ delta buffer
 likes_count column
 ```
 
+## 10.3. Lưu trữ Delta buffer
+
 Data phát sinh (delta) có thể lưu trong Redis hoặc table database
 
-**Dùng Redis để lưu buffer data**
+### 10.3.1. Dùng Redis để lưu buffer data
 
 Key:
 ```
@@ -621,21 +610,23 @@ Worker:
 likes_count = likes_count + delta
 ```
 
-**Dùng Delta Table**
+### 10.3.2. Dùng Delta Table
+Table:
 ```
 post_like_deltas(post_id, delta)
 ```
+
 Worker flush:
 ```sql
 UPDATE posts
 SET likes_count = likes_count + delta
 ```
 
-**Idempotent Delta Buffer:**
+### 10.3.3. Xử lý Idempotent Delta Buffer
 
 Khi "replay" dữ liệu từ Delta Buffer (Redis hoặc Delta Table) vào bảng chính, chúng ta cần đảm bảo: Mỗi Delta chỉ được cộng một lần duy nhất.
 
-1\. Problem
+#### 1. Problem
 
 Khi dùng Delta Buffer, flow thường là:
 ```
@@ -657,8 +648,7 @@ WHERE id = 42;
 
 Nhưng nếu worker bị retry, crash, replay job thì delta có thể bị apply nhiều lần. Kết quả là likes_count sai
 
-
-2\. Idempotency Principle
+#### 2. Idempotency Principle
 
 Replay phải đảm bảo:
 - replay 1 lần = replay 100 lần
@@ -666,8 +656,7 @@ Replay phải đảm bảo:
 
 Đây gọi là: Idempotent Operation (Phép toán độc lập)
 
-3\. Strategy A — Delta Table + Offset Tracking
-
+#### 3. Strategy A — Delta Table + Offset Tracking
 Trên bảng posts, ta thêm một cột last_processed_delta_id.
 Khi Replay, ta chỉ lấy các delta có id > last_processed_delta_id.
 ```sql
@@ -684,7 +673,7 @@ WHERE p.id = sub.post_id;
 ```
 Lợi ích: Đây là cách làm Idempotent tuyệt đối. Dù Worker có crash và chạy lại 100 lần, nó vẫn chỉ lấy những dữ liệu mới hơn con số max_id đã lưu.
 
-4\. Strategy B — Redis Delta Buffer
+#### 4. Strategy B — Redis Delta Buffer
 
 Nếu dùng Redis, vấn đề là lệnh GET để lấy delta rồi cập nhật vào DB, rồi SET 0 không atomic (có thể mất Like phát sinh ở giữa 2 lệnh).
 
@@ -703,7 +692,7 @@ delta = redis.eval(script, keys: ["post_likes_buffer:#{post_id}"])
 ```
 
 
-## 11. Finalization
+## 11. Finalization, Audit
 
 Sau khi:
 - backfill xong
@@ -740,7 +729,7 @@ ALTER TABLE posts
 VALIDATE CONSTRAINT posts_likes_count_not_null;
 ```
 
-**Đặc điểm:** Lệnh này quét bảng nhưng không lock việc đọc/ghi. Nếu phát hiện dòng nào NULL, nó sẽ báo lỗi. Lúc này bạn chỉ cần chạy Audit/Fix rồi chạy lại lệnh này.
+**Đặc điểm:** Lệnh này quét bảng nhưng không lock việc đọc/ghi. Nếu phát hiện dòng nào NULL, nó sẽ báo lỗi. Lúc này chỉ cần chạy Audit/Fix rồi chạy lại lệnh này.
 
 **Chiến lược Audit:**
 
@@ -895,7 +884,7 @@ AUDIT & ANALYZE
 Hiểu về phiên bản Database đang dùng giúp chúng ta chọn được con đường ngắn nhất. Nhưng dù con đường có ngắn đến đâu, nguyên tắc 'Atomic' và 'Audit' vẫn là kim chỉ nam không được phép thay đổi
 ```
 
-## 12. Online Migration Timeline
+# 12. Online Migration Timeline
 
 Production rollout:
 ```
