@@ -6,7 +6,25 @@
 - Mục tiêu: bảo đảm chính xác, atomicity, hiệu suất hợp lý.
 - PostgreSQL + Rails.
 
-------------------------------------------------------------------------
+## Roadmap:
+- **v1.0:**  Basic counter design
+- **v1.1:**  Race condition analysis
+- **v1.2:**  Counter migration for existing system
+- **v1.3:**  Online NOT NULL migration pattern
+- **v1.4:**  Support Postgres >= 11
+- **v1.5:**  Update migration
+- **v1.6:**  Idempotent Delta Replay
+- **v1.7:**  Sharded counter
+
+## Bảng Tổng kết Chiến thuật
+```
+Version     Công nghệ chính     Giải quyết vấn đề               Quy mô phù hợp
+-----------------------------------------------------------------------------------
+1.1         Atomic SQL          Race condition đơn giản         Startup / MVP
+1.2 - 1.5   Pg 11+ Metadata     Downtime khi Migration          Hệ thống đang lớn
+1.6         Redis Delta Buffer  Write heavy (tần suất ghi cao)  High Traffic
+1.7         Hybrid Shards       Hot Row Lock (Tranh chấp dòng)  Ultra-Scale (Celeb)
+```
 
 # 1. Basic Like / Unlike Model
 
@@ -899,17 +917,194 @@ Lock schema constraints
 - No Lost Update (Không mất cập nhật)
 - Safe Migration (Di chuyển an toàn)
 
+# 13. Hybrid Sharded Counter (v1.7)
+Mục tiêu: Giải quyết vấn đề Hot Row Contention (Nhiều Worker cùng tranh chấp lock 1 dòng của ngôi sao).
 
-------------------------------------------------------------------------
-# Roadmap:
-- **v1.0:**  Basic counter design
-- **v1.1:**  Race condition analysis
-- **v1.2:**  Counter migration for existing system
-- **v1.3:**  Online NOT NULL migration pattern
-- **v1.4:**  Support Postgres >= 11
-- **v1.5:**  Update migration
-- **v1.6:**  Idempotent Delta Replay
-- **v2**: Handling higher traffic (counter contention)
-- **v3**: Delta tables / batch aggregation
-- **v4**: Distributed counters / caching
-- **v5**: Large-scale architecture (queues, sharded counters, etc.)
+## 13.1 Phân định vai trò (The Architecture)
+```
+Thành phần    Công nghệ   Vai trò chính
+------------- ----------- --------------------
+Delta Buffer  Redis       Bắt buộc. Tiếp nhận Like/Unlike ngay lập tức từ User. Chặn 99% áp lực ghi vào DB.
+Shard Table   Postgres    Tùy chọn (Chỉ cho Hot Post). Dùng để Flush dữ liệu từ Redis xuống mà không gây Row Lock trên bảng chính.
+Main Table    Postgres    Gốc. Lưu con số cuối cùng posts.likes_count.
+```
+
+## 13.2. Cơ chế Adaptive Sharding (Linh hoạt)
+Hệ thống tự động nhận diện bài post "Hot" thông qua vận tốc (Velocity) trong Redis.
+- Normal Post: Ghi thẳng vào posts.likes_count.
+- Hot Post: Ghi vào post_like_shards (chia tải ra $N$ dòng khác nhau).
+- Tính Dynamic: Một bài post có thể đạt vận tốc 2000 likes/phút lúc 8:00 (vào Shard) nhưng đến 8:05 chỉ còn 50 likes/phút (vào Main Table). Hệ thống tự thích nghi mà không cần can thiệp thủ công.
+
+```ruby
+# app/controllers/likes_controller.rb
+def create
+  # Một lệnh duy nhất, đảm bảo tính nhất quán
+  LikeGateway.record_like(params[:post_id])
+
+  render json: { status: :ok }
+end
+
+# app/services/like_gateway.rb
+# ta đẩy toàn bộ logic ghi nhận vào một Script. Một khi Script này chạy, hoặc là tất cả thành công, hoặc là không có gì thay đổi.
+class LikeGateway
+  # Script này thực hiện:
+  # 1. Tăng Delta (để cộng vào DB)
+  # 2. Tăng Velocity (để track độ nóng)
+  # 3. Trả về giá trị Delta hiện tại để App quyết định có đẩy Job hay không
+  LUA_GATEWAY_SCRIPT = <<~LUA
+    local delta = redis.call('incr', KEYS[1])
+    local velocity_key = KEYS[2]
+    redis.call('incr', velocity_key)
+    redis.call('expire', velocity_key, 70)
+    return delta
+  LUA
+
+  def self.record_like(post_id)
+    timestamp = Time.now.to_i / 10
+    delta_key = "post_likes_delta:#{post_id}"
+    velocity_key = "post_velocity:#{post_id}:#{timestamp}"
+
+    # Thực thi nguyên tử trong Redis
+    delta = Redis.current.eval(LUA_GATEWAY_SCRIPT, keys: [delta_key, velocity_key])
+
+    # Chỉ đẩy Job nếu đây là lượt Like đầu tiên trong đợt (Throttling)
+    # Hoặc nếu delta tích lũy đủ lớn (ví dụ > 50)
+    if delta == 1 || delta % 50 == 0
+      PostLikeFlushWorker.perform_in(1.second, post_id)
+    end
+  end
+end
+
+# app/services/like_buffer_service.rb
+class LikeBufferService
+  # Script Lua này đảm bảo:
+  # 1. Đọc giá trị hiện tại của Delta.
+  # 2. Ngay lập tức reset key đó về 0.
+  # 3. Trả về giá trị đã đọc được.
+  LUA_RETRIEVE_AND_RESET = <<~LUA
+    local current_delta = redis.call('get', KEYS[1])
+    if current_delta then
+      redis.call('set', KEYS[1], 0)
+      return current_delta
+    else
+      return 0
+    end
+  LUA
+
+  def self.retrieve_and_reset_delta(post_id)
+    key = "post_likes_delta:#{post_id}"
+
+    # Thực thi Script Lua thông qua Redis client
+    result = Redis.current.eval(LUA_RETRIEVE_AND_RESET, keys: [key])
+    result.to_i
+  end
+end
+
+# app/models/post_velocity.rb
+class PostVelocity
+  BUCKET_SIZE = 10 # 10 giây mỗi xô
+  WINDOW_SIZE = 6  # 6 xô = 60 giây
+
+  def self.get_last_60s(post_id)
+    now = Time.now.to_i
+
+    # 1. Tạo danh sách các keys cho 6 bucket gần nhất
+    # Dùng đúng công thức bucketization: timestamp / 10
+    keys = (0...WINDOW_SIZE).map do |i|
+      bucket_timestamp = (now - i * BUCKET_SIZE) / BUCKET_SIZE
+      "post_velocity:#{post_id}:#{bucket_timestamp}"
+    end
+
+    # 2. Dùng MGET để lấy giá trị tất cả keys trong 1 lần gọi duy nhất (O(N))
+    values = Redis.current.mget(*keys)
+
+    # 3. Loại bỏ nil (các xô chưa có dữ liệu) và cộng tổng
+    values.compact.map(&:to_i).sum
+  end
+end
+
+# app/workers/post_like_flush_worker.rb
+class PostLikeFlushWorker
+  include Sidekiq::Worker
+
+  def perform(post_id)
+    # 1. Lấy Delta và Reset bằng Lua (Tránh Lost Update)
+    delta = LikeBufferService.retrieve_and_reset_delta(post_id)
+    return if delta <= 0
+
+    # 2. Kiểm tra vận tốc 60s gần nhất (6 bucket x 10s)
+    velocity = PostVelocity.get_last_60s(post_id)
+
+    if velocity > 500
+      # Kịch bản HOT: Ghi vào Shards để Postgres song song hóa
+      upsert_to_shard(post_id, rand(0..9), delta)
+    else
+      # Kịch bản NORMAL: Ghi thẳng vào Main Table
+      Post.where(id: post_id).update_all("likes_count = COALESCE(likes_count, 0) + #{delta}")
+    end
+  end
+
+  private
+
+  def upsert_to_shard(post_id, shard_index, delta)
+    sql = <<-SQL
+      INSERT INTO post_like_shards (post_id, shard_index, likes_count, created_at, updated_at)
+      VALUES (?, ?, ?, NOW(), NOW())
+      ON CONFLICT (post_id, shard_index)
+      DO UPDATE SET 
+        likes_count = post_like_shards.likes_count + EXCLUDED.likes_count,
+        updated_at = NOW()
+    SQL
+    ActiveRecord::Base.connection.execute(
+      ActiveRecord::Base.send(:sanitize_sql_array, [sql, post_id, shard_index, delta])
+    )
+  end
+end
+```
+
+## 13.3. Kỹ thuật Snapshot Aggregation (Gom tiền lẻ)
+Sử dụng Watermark (max_id) để đảm bảo việc gom tổng từ Shard về Main Table là Idempotent (không cộng lặp, không xóa nhầm).
+
+```ruby
+# app/services/counter_aggregator.rb
+# gom "tiền lẻ" từ các mảnh Shard về bảng chính một cách an toàn.
+class CounterAggregator
+  def self.process(post_id)
+    # 1. Snapshot mốc ID lớn nhất để tránh Race Condition với các Like mới chèn vào
+    max_id = ActiveRecord::Base.connection.select_value(
+      "SELECT MAX(id) FROM post_like_shards WHERE post_id = #{post_id}"
+    )
+    return if max_id.nil?
+
+    Post.transaction do
+      # 2. Cộng dồn vào Main Table và Xóa (Trong 1 Transaction)
+      aggregation_sql = <<-SQL
+        UPDATE posts p
+        SET likes_count = p.likes_count + sub.total
+        FROM (
+          SELECT SUM(likes_count) as total
+          FROM post_like_shards
+          WHERE post_id = ? AND id <= ?
+        ) sub
+        WHERE p.id = ?
+      SQL
+
+      ActiveRecord::Base.connection.execute(
+        ActiveRecord::Base.send(:sanitize_sql_array, [aggregation_sql, post_id, max_id, post_id])
+      )
+
+      # 3. Xóa các bản ghi đã gom xong
+      ActiveRecord::Base.connection.execute(
+        ActiveRecord::Base.send(:sanitize_sql_array,
+          ["DELETE FROM post_like_shards WHERE post_id = ? AND id <= ?", post_id, max_id]
+        )
+      )
+    end
+  end
+end
+```
+
+`Mindset`
+```
+Trong thiết kế hệ thống, không có giải pháp hoàn hảo nhất, chỉ có giải pháp phù hợp nhất với ngưỡng tải. Một kỹ sư giỏi là người biết khi nào nên dùng một lệnh SQL đơn giản và khi nào nên triển khai một hệ thống Sharded Counter phức tạp.
+```
