@@ -283,6 +283,10 @@ end
 
 - Chỉ nên dùng distributed lock với Redis cho trường hợp efficiency lock như: cache rebuild, cron dedup, background job, vì trong trường hợp xấu nhất chỉ là duplicate work. Còn đối với hệ thống cần correctness lock (KHÔNG nên dùng Redis) như: bank transfer, inventory deduction, distributed transaction thì nên dùng consensus system
 
+`Các Gem nổi tiếng`
+- redlock-rb (implement Redlock algorithm)
+- redis_queued_locks
+- Redis::Lock
 
 ## 3. Sớm cập nhật cache (Probabilistic Early Recomputation)
 Thay vì đợi cache hết hạn rồi mới load lại, hệ thống sẽ tính toán khả năng cần làm mới cache dựa trên một thuật toán xác suất khi thời gian hết hạn (TTL) sắp đến.
