@@ -1,9 +1,10 @@
-# Xử lý Cache Stampede -- v1.0
+# Xử lý Cache Stampede -- v1.1
 
 Cache Stampede không chỉ là cache miss, dẫn đến hoàng loạt request đổ thẳng vào DB, mà là sự kết hợp của: Key cực hot + Thời gian tính toán (recomputation) lâu + Nhiều request đồng thời (high concurrency)
 
 ## Roadmap:
 - **v1.0:**  Init doc, TTL Jitter, distributed lock
+- **v1.1:**  Probabilistic Early Recomputation
 
 ## 1. TTL Jitter (Randomized Expiration)
 Đây là kỹ thuật đơn giản nhất.
@@ -289,32 +290,69 @@ end
 - Redis::Lock
 
 ## 3. Sớm cập nhật cache (Probabilistic Early Recomputation)
-Thay vì đợi cache hết hạn rồi mới load lại, hệ thống sẽ tính toán khả năng cần làm mới cache dựa trên một thuật toán xác suất khi thời gian hết hạn (TTL) sắp đến.
-- **Cách hoạt động:** Một request bất kỳ khi đọc cache sẽ thực hiện một phép tính ngẫu nhiên. Nếu "trúng thưởng", request đó sẽ chủ động đi cập nhật database sớm vài giây trước khi cache thực sự chết.
-- **Công thức gợi ý:** $P(recompute) = e^{-\Delta \cdot \beta / (TTL - now)}$ (với $\Delta$ là thời gian tính toán, $\beta$ là hệ số điều chỉnh).
+Một cách tiếp cận khác để giảm cache stampede là không chờ đến khi cache hết hạn rồi mới tái tạo dữ liệu. Thay vào đó, hệ thống cho phép một số request ngẫu nhiên chủ động làm mới cache trước thời điểm hết hạn. Kỹ thuật này được gọi là Probabilistic Early Recomputation (hoặc XFetch).
+
+Ý tưởng chính là: mỗi lần đọc cache, hệ thống thực hiện một phép tính xác suất. Nếu điều kiện thỏa mãn, request đó sẽ thực hiện việc recompute và cập nhật cache sớm. Nhờ vậy, việc tái tạo cache được phân tán ngẫu nhiên giữa các request, tránh tình trạng nhiều request đồng thời truy cập database khi cache vừa hết hạn.
+
+Cách hoạt động:
+- Giả sử cache lưu thêm hai metadata:
+    - expiry: thời điểm cache hết hạn
+    - delta: thời gian cần để tái tạo dữ liệu (thời gian fetch từ database)
+
+
+Khi đọc cache, hệ thống kiểm tra điều kiện:
+
+$t_{now} + \Delta \cdot \beta \cdot (-\ln(U)) \ge t_{expiry}$
+
+Trong đó:
+
+- `t_now`: current time
+- `t_expiry`: cache expiration time
+- `Δ`: recomputation time
+- `U`: random number in (0,1)
+- `β`: tuning factor
+
+Pseudo code:
+```
+now + delta * beta * (-log(rand)) >= expiry
+```
 
 Ruby sample code:
 ```ruby
 def get_data_probabilistic(key, ttl, beta = 1.0)
-  cached_item = $redis.hgetall(key) # Giả sử lưu hash: { "data" => "...", "expiry" => "..." }
+  cached = $redis.hgetall(key) # Giả sử lưu hash: { "data" => "...", "expiry" => "..." }
+  return nil if cached.empty?
 
   now = Time.now.to_f
-  data = JSON.parse(cached_item["data"])
-  expiry = cached_item["expiry"].to_f # Thời điểm hết hạn thực tế
+  data = JSON.parse(cached["data"])
+  expiry = cached["expiry"].to_f
+  delta  = cached["delta"].to_f
 
-  # Công thức X-Fetch: ngẫu nhiên hóa việc fetch lại dựa trên thời gian còn lại
-  # gap = thời gian thực thi (giả sử 50ms)
-  gap = 0.05
-  if now - (gap * beta * Math.log(rand)) >= expiry
-    puts "Probabilistic hit! Refreshing early..."
-    new_data = fetch_from_db()
-    save_to_cache(key, new_data, ttl)
+  # Probabilistic early recomputation (XFetch)
+  u = rand
+  if now + delta * beta * (-Math.log(u)) >= expiry
+    start = Time.now
+    new_data = fetch_from_db
+    new_delta = Time.now - start
+
+    save_to_cache(key, new_data, ttl, new_delta)
     return new_data
   end
 
   data
 end
 ```
+
+**Ưu điểm:**
+
+So với distributed lock, kỹ thuật này:
+- Không cần lock phân tán
+- Không tạo lock contention
+- Giảm đáng kể nguy cơ cache stampede
+- Dễ triển khai và ít phụ thuộc vào hạ tầng
+
+Nhờ những ưu điểm này, Probabilistic Early Recomputation thường được sử dụng trong các hệ thống cache quy mô lớn như CDN, proxy cache hoặc các dịch vụ có lượng truy cập cao.
+
 
 ## 3. Gia hạn thời gian ảo (Soft Expiration)
 Bạn lưu trữ dữ liệu trong cache kèm theo một mốc thời gian "hết hạn mềm".
