@@ -311,7 +311,7 @@ Trong đó:
 - `t_expiry`: cache expiration time
 - `Δ`: recomputation time
 - `U`: random number in (0,1)
-- `β`: tuning factor
+- `β`: tuning factor, là "nút vặn" duy nhất để điều chỉnh. $\beta = 0$ là tắt tính năng, $\beta$ càng lớn thì cache càng "tươi" nhưng DB load càng tăng.
 
 Pseudo code:
 ```
@@ -322,15 +322,24 @@ Ruby sample code:
 ```ruby
 def get_data_probabilistic(key, ttl, beta = 1.0)
   cached = $redis.hgetall(key) # Giả sử lưu hash: { "data" => "...", "expiry" => "..." }
-  return nil if cached.empty?
+  if cached.nil? || cached.empty?
+    start = Time.now
+    data = fetch_from_db
+    delta = Time.now - start
+
+    save_to_cache(key, data, ttl, delta)
+    return data
+  end
 
   now = Time.now.to_f
-  data = JSON.parse(cached["data"])
   expiry = cached["expiry"].to_f
   delta  = cached["delta"].to_f
 
-  # Probabilistic early recomputation (XFetch)
+  # Random number trong (0,1)
   u = rand
+  u = 0.0000001 if u == 0
+
+  # Probabilistic Early Recomputation (XFetch)
   if now + delta * beta * (-Math.log(u)) >= expiry
     start = Time.now
     new_data = fetch_from_db
@@ -340,7 +349,24 @@ def get_data_probabilistic(key, ttl, beta = 1.0)
     return new_data
   end
 
+  data = JSON.parse(cached["data"])
   data
+end
+
+def save_to_cache(key, data, ttl, delta)
+  expiry = Time.now.to_f + ttl
+  # có thể thêm Jitter
+  # ttl = DEFAULT_TTL + rand(5)
+  # expiry = Time.now.to_f + ttl
+
+  $redis.hmset(
+    key,
+    "data", data.to_json,
+    "expiry", expiry,
+    "delta", delta
+  )
+
+  $redis.expire(key, ttl)
 end
 ```
 
