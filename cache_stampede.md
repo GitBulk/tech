@@ -499,10 +499,60 @@ def get_data(key)
   return cached unless should_recompute?(cached)
 
   coalescer.fetch(key) do
+    start = Time.now
+    # có thể kết hợp thêm RequestCoalescer
     data = fetch_from_db
-    write_cache(key, data)
+    delta = Time.now - start
+
+    # TTL: 60s, Dữ liệu này sẽ hết hạn sau 60 giây kể từ thời điểm hiện tại
+    $redis.hmset(key, {
+      data: data.to_json,
+      expires_at: Time.now.to_f + 60,
+      delta: delta
+    })
+
+    # Phải set expire cho chính cái key để tránh việc tràn Redis.
+    # nên để TTL của Redis lớn hơn TTL mà trong code một chút (Grace Period)
+    $redis.expire(key, 120) # Redis sẽ xóa hẳn key này sau 120 giây
+
+    # để tránh round trip hmset và expire thì ta có thể dùng lệnh multi hoặc LUA
+    # update_cache_atomic(key, data, ttl, delta)
     data
   end
+end
+
+def update_cache_atomic(key, data, ttl, delta)
+  lua_script = <<-LUA
+    redis.call("HMSET", KEYS[1], "data", ARGV[1], "expires_at", ARGV[2], "delta", ARGV[3])
+    redis.call("EXPIRE", KEYS[1], ARGV[4])
+  LUA
+
+  $redis.eval(lua_script,
+    keys: [key],
+    argv: [data.to_json, Time.now.to_f + ttl, delta, ttl * 2]
+  )
+end
+
+# BETA (Hệ số nhạy cảm):
+# BETA = 1.0: Giá trị mặc định, cân bằng giữa việc bảo vệ DB và tiết kiệm tài nguyên.
+# BETA > 1.0: Hệ thống sẽ trở nên "lo lắng" hơn, refresh sớm hơn và thường xuyên hơn.
+# BETA = 0: Thuật toán trở thành cache bình thường (chỉ refresh khi đã hết hạn hoàn toàn).
+
+BETA = 1.0
+
+def should_recompute?(cached)
+  return true if cached.nil?
+
+  now = Time.now.to_f
+  # lấy delta thực tế, nếu không thì mặc định 50ms
+  expiry = cached[:expiry].to_f
+  delta = cached[:delta]&.to_f || 0.05
+  # rand không bao giờ nên bằng 0 để tránh lỗi Log(0) là undefined
+  random_factor = Math.log(rand(0.0001..1.0))
+
+  threshold = now - (delta * BETA * random_factor)
+
+  threshold >= expiry
 end
 ```
 
