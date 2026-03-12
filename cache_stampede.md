@@ -1,10 +1,11 @@
-# Xử lý Cache Stampede -- v1.1
+# Xử lý Cache Stampede -- v1.2
 
 Cache Stampede không chỉ là cache miss, dẫn đến hoàng loạt request đổ thẳng vào DB, mà là sự kết hợp của: Key cực hot + Thời gian tính toán (recomputation) lâu + Nhiều request đồng thời (high concurrency)
 
 ## Roadmap:
 - **v1.0:**  Init doc, TTL Jitter, distributed lock
 - **v1.1:**  Probabilistic Early Recomputation
+- **v1.2:**  Probabilistic Recomputation + Request Coalescing
 
 ## 1. TTL Jitter (Randomized Expiration)
 Đây là kỹ thuật đơn giản nhất.
@@ -353,8 +354,342 @@ So với distributed lock, kỹ thuật này:
 
 Nhờ những ưu điểm này, Probabilistic Early Recomputation thường được sử dụng trong các hệ thống cache quy mô lớn như CDN, proxy cache hoặc các dịch vụ có lượng truy cập cao.
 
+## 4. Kết hợp Probabilistic Early Recomputation với Request Coalescing
 
-## 3. Gia hạn thời gian ảo (Soft Expiration)
+Mặc dù Probabilistic Early Recomputation giúp phân tán việc làm mới cache theo thời gian, vẫn có khả năng nhiều request trên cùng một server cùng lúc quyết định recompute dữ liệu. Khi đó hệ thống có thể vẫn tạo ra nhiều truy vấn database không cần thiết.
+
+Để giảm thêm tải cho database, có thể kết hợp kỹ thuật Request Coalescing.
+
+Ý tưởng: khi một request đã bắt đầu tái tạo dữ liệu, các request khác trên cùng server sẽ không truy vấn database, mà chờ kết quả của request đang xử lý.
+
+Nhờ vậy nhiều request đồng thời sẽ được gom lại thành một truy vấn database duy nhất.
+
+Ví dụ: Giả sử cache sắp hết hạn và probabilistic recomputation được kích hoạt:
+```
+t = 54s   Request A → recompute → query DB
+t = 54s   Request B → thấy A đang recompute → chờ
+t = 55s   Request C → thấy A đang recompute → chờ
+```
+
+Kết quả:
+```
+3 requests
+→ 1 DB query
+```
+Sau khi request A hoàn thành:
+```
+cache updated
+A, B, C đều nhận cùng kết quả
+```
+
+**Triển khai trong môi trường nhiều web server**
+
+Trong hệ thống có nhiều node (ví dụ 10 web servers phía sau load balancer), Request Coalescing thường chỉ thực hiện trong phạm vi một process. Điều này vẫn mang lại lợi ích lớn vì phần lớn request burst (một lượng lớn request đến gần như cùng lúc trong một khoảng thời gian rất ngắn) thường tập trung vào một số node nhất định.
+
+Mỗi web server sẽ có một bảng in-flight requests trong memory để theo dõi các request đang recompute dữ liệu.
+
+Ruby sample code:
+```
+Gem concurrent-ruby
+```
+Ví dụ triển khai đơn giản bằng Mutex để đảm bảo thread-safe:
+```ruby
+require "concurrent"
+
+class RequestCoalescer
+  def initialize
+    @in_flight = {}
+    @mutex = Mutex.new
+  end
+
+  def fetch(key)
+    promise = nil
+
+    @mutex.synchronize do
+      promise = @in_flight[key]
+
+      unless promise
+        promise = Concurrent::Promise.execute do
+          yield
+        end
+
+        @in_flight[key] = promise
+      end
+    end
+
+    begin
+      promise.value
+      # or timeout 2s
+      # promise.value(2)
+    ensure
+      cleanup(key, promise)
+    end
+  end
+
+  private
+
+  def cleanup(key, promise)
+    @mutex.synchronize do
+      # chỉ xóa nếu promise vẫn là cái đang lưu
+      @in_flight.delete(key) if @in_flight[key] == promise
+    end
+  end
+end
+```
+
+Cách dùng:
+```ruby
+coalescer = RequestCoalescer.new
+
+data = coalescer.fetch("user:42") do
+  fetch_from_db
+end
+```
+Nếu 10 thread cùng lúc:
+```
+coalescer.fetch("user:42")
+```
+Timeline:
+```
+Thread A → chạy fetch_from_db
+Thread B → chờ
+Thread C → chờ
+...
+Thread J → chờ
+```
+Kết quả:
+```
+10 requests
+→ 1 DB query
+```
+
+**Lợi ích của việc kết hợp hai kỹ thuật**
+
+Ruby sample code:
+```ruby
+def get_data(key)
+  cached = read_cache(key)
+
+  return cached unless should_recompute?(cached)
+
+  coalescer.fetch(key) do
+    data = fetch_from_db
+    write_cache(key, data)
+    data
+  end
+end
+```
+
+Khi sử dụng đồng thời:
+- Probabilistic Early Recomputation: phân tán việc tái tạo cache theo thời gian
+- Request Coalescing: đảm bảo mỗi server chỉ thực hiện một truy vấn database
+
+Kết quả:
+```
+N requests
+→ 1 DB query / server
+```
+
+Điều này giúp giảm đáng kể áp lực lên database, đặc biệt trong các hệ thống có nhiều web server và lượng truy cập lớn.
+
+So với giải pháp **distributed lock**, cách tiếp cận này đơn giản hơn, ít phụ thuộc vào hạ tầng hơn và tránh được các vấn đề lock contention hoặc lock failure trong môi trường phân tán.
+
+**Cải tiến RequestCoalescer V2**
+
+Ta nâng cấp lên RequestCoalescer v2 để an toàn hơn trong production.
+Mục tiêu:
+```
+thread-safe
+không memory leak
+không in-flight explosion
+có timeout
+có cleanup TTL
+```
+Thiết kế:
+```
+RequestCoalescer
+ ├── in_flight map
+ ├── TTL cho entry
+ ├── max_entries guard
+ └── promise timeout
+```
+
+```ruby
+require "concurrent"
+
+class V2::RequestCoalescer
+  DEFAULT_TIMEOUT = 2
+  # nếu promise chết hoặc thread crash, entry sẽ bị dọn
+  DEFAULT_TTL = 5
+
+  # Chống việc 10k keys miss cùng lúc → in_flight map phình to → memory leak
+  DEFAULT_MAX_ENTRIES = 1000
+
+  Entry = Struct.new(:promise, :created_at)
+
+  def initialize(timeout: DEFAULT_TIMEOUT, ttl: DEFAULT_TTL, max_entries: DEFAULT_MAX_ENTRIES)
+    @timeout = timeout
+    @ttl = ttl
+    @max_entries = max_entries
+
+    @in_flight = {}
+    @mutex = Mutex.new
+  end
+
+  def fetch(key)
+    entry = nil
+
+    @mutex.synchronize do
+      cleanup_expired
+
+      entry = @in_flight[key]
+
+      unless entry
+        guard_capacity
+
+        promise = Concurrent::Promise.execute { yield }
+        entry = Entry.new(promise, Time.now.to_f)
+
+        @in_flight[key] = entry
+      end
+    end
+
+    begin
+      # có timeout, tránh việc DB query bị treo → thread chờ vô hạn
+      entry.promise.value(@timeout)
+    ensure
+      cleanup_key(key, entry)
+    end
+  end
+
+  private
+
+  def cleanup_key(key, entry)
+    @mutex.synchronize do
+      if @in_flight[key] == entry
+        @in_flight.delete(key)
+      end
+    end
+  end
+
+  def cleanup_expired
+    now = Time.now.to_f
+
+    @in_flight.delete_if do |_, entry|
+      now - entry.created_at > @ttl
+    end
+  end
+
+  def guard_capacity
+    if @in_flight.size >= @max_entries
+      # fallback strategy: xóa entry cũ nhất
+      oldest = @in_flight.min_by { |_, e| e.created_at }
+      @in_flight.delete(oldest[0]) if oldest
+    end
+  end
+end
+```
+
+Cách dùng:
+```ruby
+coalescer = V2::RequestCoalescer.new
+coalescer.fetch("user:#{id}") do
+  User.find(id)
+end
+```
+
+**Thiết kế hệ thống:**
+
+Nếu hệ thống có:
+```
+Nginx làm load balancer
+10 web servers
+Postgres (master + slave)
+```
+sau khi áp dụng:
+```
+Probabilistic recompute
++
+Request coalescing
+```
+thì DB load sẽ chuyển từ:
+```
+burst = 5000 queries thành ≈ 10 queries (vì 1 query / server).
+```
+
+**Vì sao các hệ thống lớn thường tránh Distributed Lock cho cache**
+
+Mặc dù distributed lock có thể ngăn cache stampede bằng cách đảm bảo chỉ một request tái tạo dữ liệu, nhiều hệ thống quy mô lớn lại tránh sử dụng kỹ thuật này khi đọc cache nóng (hot path).
+
+Có ba lý do chính.
+
+***1. Lock tạo thêm độ trễ cho mọi request***
+
+Mỗi lần cache miss, hệ thống phải:
+```
+1. acquire lock
+2. fetch database
+3. release lock
+```
+
+Điều này khiến một thao tác đọc cache vốn dĩ rất nhanh trở thành một chuỗi thao tác mạng:
+```
+App → Redis (lock)
+App → DB
+App → Redis (unlock)
+```
+
+Trong các hệ thống có độ trễ thấp (low latency systems), việc thêm nhiều round-trip như vậy có thể làm tăng đáng kể p99 latency.
+
+***2. Lock có thể trở thành điểm nghẽn (contention)***
+
+Khi lưu lượng truy cập tăng đột biến, rất nhiều request sẽ tranh cùng một lock.
+
+Ví dụ: 5000 requests → cùng chờ 1 lock
+
+Khi đó hệ thống dễ gặp các vấn đề:
+- lock contention
+- queue buildup
+- timeout
+- retry storm
+
+Trong nhiều trường hợp, bản thân hệ thống lock có thể trở thành bottleneck mới.
+
+***3. Distributed lock không hoàn toàn đáng tin cậy***
+
+Các hệ thống lock phân tán thường dựa trên cache system như Redis hoặc Memcached. Tuy nhiên những hệ thống này không phải là hệ thống consensus mạnh.
+
+Do đó các vấn đề như sau có thể xảy ra:
+- lock timeout
+- clock drift
+- process pause (GC)
+- network jitter
+
+Những hiện tượng này có thể khiến hai client cùng tin rằng mình đang giữ lock.
+
+Vì lý do đó, nhiều hệ thống production coi distributed lock chỉ là best-effort coordination, không phải là cơ chế đồng bộ tuyệt đối.
+
+
+***4. Cách tiếp cận phổ biến hơn***
+
+Thay vì dựa vào lock, nhiều hệ thống lớn sử dụng kết hợp:
+```
+Probabilistic Early Recomputation
++
+Request Coalescing
+```
+Hai kỹ thuật này giải quyết cache stampede theo cách không cần lock toàn cục:
+- Probabilistic Early Recomputation phân tán việc tái tạo cache theo thời gian.
+- Request Coalescing đảm bảo mỗi server chỉ thực hiện một truy vấn database cho mỗi key.
+
+Kết quả là hệ thống vẫn tránh được cache stampede nhưng:
+- không có lock contention (không có nhiều rquest cùng tranh 1 lock)
+- không cần coordination giữa các node
+- latency thấp hơn
+
+Trong các hệ thống có nhiều web server phía sau load balancer, cách tiếp cận này thường đủ để giảm tải database xuống mức rất nhỏ mà không cần triển khai distributed locking phức tạp.
+
+## 5. Gia hạn thời gian ảo (Soft Expiration) (REVIEWING)
 Bạn lưu trữ dữ liệu trong cache kèm theo một mốc thời gian "hết hạn mềm".
 - Quy trình: Khi một request thấy dữ liệu đã quá hạn mềm nhưng vẫn còn trong cache (chưa đến hạn cứng), nó sẽ trả về dữ liệu cũ ngay lập tức cho người dùng, đồng thời âm thầm (asynchronous) gửi một task đi cập nhật database.
 - Kết quả: Người dùng luôn thấy dữ liệu nhanh (dù có thể hơi cũ một chút), và database không bao giờ bị dội bom.
