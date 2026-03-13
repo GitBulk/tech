@@ -852,8 +852,10 @@ Nên hỏi:
 Nếu câu trả lời là: YES YES HIGH YES
 → coalescer rất đáng dùng.
 
-## 5. Gia hạn thời gian ảo (Soft Expiration) (REVIEWING)
-Bạn lưu trữ dữ liệu trong cache kèm theo một mốc thời gian "hết hạn mềm".
+## 5. Gia hạn thời gian ảo (Soft Expiration)
+Theo triết lý Stale-While-Revalidate (SWR), cho phép hiển thị dữ liệu cũ (stale) từ bộ nhớ đệm ngay lập tức, trong khi đồng thời gửi yêu cầu cập nhật dữ liệu mới (revalidate) ở nền.
+
+Lưu trữ dữ liệu trong cache kèm theo một mốc thời gian "hết hạn mềm".
 - Quy trình: Khi một request thấy dữ liệu đã quá hạn mềm nhưng vẫn còn trong cache (chưa đến hạn cứng), nó sẽ trả về dữ liệu cũ ngay lập tức cho người dùng, đồng thời âm thầm (asynchronous) gửi một task đi cập nhật database.
 - Kết quả: Người dùng luôn thấy dữ liệu nhanh (dù có thể hơi cũ một chút), và database không bao giờ bị dội bom.
 
@@ -874,7 +876,7 @@ end
 ```
 
 ## 6. Background Refresh (Cron jobs)
-Thay vì để request của người dùng kích hoạt việc cập nhật cache (Passive), bạn chủ động cập nhật cache theo định kỳ bằng một tiến trình chạy ngầm (Active).
+Thay vì để request của người dùng kích hoạt việc cập nhật cache (Passive), ta chủ động cập nhật cache theo định kỳ bằng một tiến trình chạy ngầm (Active).
 - Áp dụng: Phù hợp với các dữ liệu biết trước là luôn nóng (ví dụ: bảng xếp hạng, tỷ giá, danh sách sản phẩm hot).
 
 Ruby sample code:
@@ -889,7 +891,10 @@ class CacheManager
   def self.refresh_hot_keys
     puts "Cron job: Refreshing hot data..."
     data = fetch_from_db()
-    $redis.set("hot_price_list", data.to_json) # Không cần TTL vì luôn được làm mới
+    # TTL = (Chu kỳ Cron) + (Thời gian trừ hao an toàn).
+    # để tránh việc cron và ttl tham gia race condition với nhau.
+    ttl = ...
+    $redis.setex("hot_price_list", ttl, data.to_json)
   end
 end
 ```
