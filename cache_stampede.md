@@ -841,6 +841,17 @@ Kết quả là hệ thống vẫn tránh được cache stampede nhưng:
 
 Trong các hệ thống có nhiều web server phía sau load balancer, cách tiếp cận này thường đủ để giảm tải database xuống mức rất nhỏ mà không cần triển khai distributed locking phức tạp.
 
+**Checklist khi implement coalescer**
+
+Nên hỏi:
+1. same key requests thường xảy ra không?
+2. duplicate rate bao nhiêu?
+3. compute/query cost bao nhiêu?
+4. burst traffic có xảy ra không?
+
+Nếu câu trả lời là: YES YES HIGH YES
+→ coalescer rất đáng dùng.
+
 ## 5. Gia hạn thời gian ảo (Soft Expiration) (REVIEWING)
 Bạn lưu trữ dữ liệu trong cache kèm theo một mốc thời gian "hết hạn mềm".
 - Quy trình: Khi một request thấy dữ liệu đã quá hạn mềm nhưng vẫn còn trong cache (chưa đến hạn cứng), nó sẽ trả về dữ liệu cũ ngay lập tức cho người dùng, đồng thời âm thầm (asynchronous) gửi một task đi cập nhật database.
