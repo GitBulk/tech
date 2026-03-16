@@ -525,20 +525,18 @@ Thay vì dùng Sidekiq để Command (ra lệnh), chúng ta chuyển sang dùng 
 
 3\. Ưu thế về mặt "Backpressure"
 
-Với Sidekiq, nếu DB chậm, hàng triệu job sẽ kẹt trong Redis. Với Kafka, nếu DB chậm, Consumer sẽ tự động đọc chậm lại (Backpressure). Dữ liệu vẫn nằm an toàn trên đĩa cứng của Kafka broker chờ đến khi DB sẵn sàng, giúp hệ thống Nova của bạn "co giãn" (elastic) tốt hơn trước các đợt cao điểm.
+Với Sidekiq, nếu DB chậm, hàng triệu job sẽ kẹt trong Redis. Với Kafka, nếu DB chậm, Consumer sẽ tự động đọc chậm lại (Backpressure). Dữ liệu vẫn nằm an toàn trên đĩa cứng của Kafka broker chờ đến khi DB sẵn sàng, giúp hệ thống "co giãn" (elastic) tốt hơn trước các đợt cao điểm.
 
 
-### V4.1 Partial Fanout Write
+### V4.1 - Partial Fanout Write (Đối Phó Với Những User Nổi Tiếng)
 Ở phiên bản V4, nếu 1 user nổi tiếng, vd: Elon Musk có nhiều người follow thì việc insert vào user_feeds như vậy sẽ có hàng triệu dòng được insert. Ta có thể phân loại user nào được fan-out write và fallback bằng cơ chế fan-out read và catchup bù dữ liệu.
 
 Loại A (Active/High-Priority) và Loại B (Inactive/Low-Priority) để áp dụng Hybrid Fan-out
-
 
 #### 1. Phân loại Follower (The Scoring Layer)
 
 Thay vì chỉ có bảng followers đơn giản, chúng ta cần một cơ chế để xác định ai là "Loại A".
 - Tiêu chí: last_active_at trong vòng 7 ngày hoặc có tương tác gần đây.
-
 
 #### 2. Kiến trúc Hybrid Fan-out (Write A + Read B)
 
@@ -554,19 +552,46 @@ Luồng xử lý sẽ thay đổi như sau:
 class FanoutDispatcherJob
   include Sidekiq::Worker
 
-  def perform(post_id, author_id)
-    batch_size = 1000
-    last_follower_id = 0
+  MAX_FANOUT_THRESHOLD = 10_000
+  ACTIVE_THRESHOLD = 7.days.ago
 
+  def perform(post_id)
+    post = Post.find_by(id: post_id)
+    # bài viết có thể bị xóa
+    return if post.nil?
+
+    author = post.user
+    return if author.nil?
+
+    author_id = author.id
+    # 1. Đếm nhanh số lượng follower active để quyết định chiến lược
+    # Giả sử relation tới bảng users là followed_user
+    # active_count = Follower.joins(:followed_user)
+    #                        .where(user_id: author_id)
+    #                        .where("users.last_active_at > ?", ACTIVE_THRESHOLD)
+    #                        .count
+
+    # if active_count > MAX_FANOUT_THRESHOLD
+    #   # Nếu là "Siêu sao" đang có quá nhiều người online -> Bỏ qua Fan-out write
+    #   # Bài viết này sẽ được xử lý bằng Pull Model ở tầng API
+    #   Rails.logger.info "Post #{post_id} by #{author_id} skipped fan-out (Active followers: #{active_count})"
+    #   return
+    # end
+
+    # 1.1 một cách đơn giản hơn là có thể maintain cột follower_count trong bảng user
+    # tức là người nổi tiếng
+    return unless author.follower_count.to_i > MAX_FANOUT_THRESHOLD
+
+    # 2. Tiến hành Keyset Pagination với Join
+    last_follower_id = 0
+    batch_size = 1000
+    total_import = 0
     loop do
-      # Chỉ lấy những Follower Loại A
-      # Giả sử chúng ta Join với bảng users để check last_active_at
-      # Hoặc check trong một bảng cached_active_users
-      active_follower_ids = Follower.joins("INNER JOIN users ON followers.followed_by_user_id = users.id")
+      active_follower_ids = Follower.joins(:followed_user)
                                     .where(user_id: author_id)
+                                    .where("users.last_active_at > ?", ACTIVE_THRESHOLD)
                                     .where("followers.followed_by_user_id > ?", last_follower_id)
-                                    .where("users.last_active_at > ?", 7.days.ago) # Điều kiện Loại A
-                                    .order(:followed_by_user_id)
+                                    .order("followers.followed_by_user_id ASC")
                                     .limit(batch_size)
                                     .pluck(:followed_by_user_id)
 
@@ -574,14 +599,106 @@ class FanoutDispatcherJob
 
       PushToFeedJob.perform_async(post_id, active_follower_ids)
 
+      total_import += batch_size
       last_follower_id = active_follower_ids.last
+      break if total_import >= MAX_FANOUT_THRESHOLD
+
+      # tiết kiệm 1 query kế vì đây đã là bactch cuối
       break if active_follower_ids.size < batch_size
     end
   end
 end
 ```
 
-#### 4. Cơ chế Fallback (The Pull Model)
+#### 4. Lưu trữ danh sách user active
+Ta cũng có thể dùng 1 sorted set trong Redis, bloom filter, redis key expiration để lưu trữ Global user active. Thông tin tham khảo: Twitter có khoảng 20-50tr người online cùng lúc (2026).
+
+**Cách A: Dùng Sorted Set (ZSET) - Khuyên dùng**
+
+Dùng ZADD với Score là Timestamp của lần cuối user active.
+
+Update: ZADD global:active_users <current_timestamp> <user_id>
+
+Dọn dẹp (Cronjob mỗi giờ): ZREMRANGEBYSCORE global:active_users -inf <7_days_ago_timestamp>
+
+Lệnh này sẽ xóa sạch tất cả những ai có timestamp cũ hơn 7 ngày chỉ trong một nốt nhạc.
+
+Redis Sorted Set (ZSET), dữ liệu được lưu trữ bằng sự kết hợp của Hash Table và Skip List. Một ZSET lưu trữ các cặp (score, member) là (64-bit timestamp, 64-bit Integer ID):
+
+Mỗi phần tử (entry) tốn khoảng 80 - 100 bytes.
+
+Với 100 triệu phần tử:
+```
+100,000,000 × 100 bytes ≈ 10 GB RAM.
+```
+Con số 100 bytes được ước tính như sau:
+
+|Thành phần           |Kích thước (ước tính)|Ghi chú                                              |
+|---------------------|---------------------|-----------------------------------------------------|
+|Member (User ID)     |8 - 16 bytes         |Nếu dùng Long/Integer. Nếu là String UUID sẽ tốn hơn.|
+|Score (Timestamp)    |8 bytes              |Double precision floating point.                     |
+|Skip List Node       |~32 bytes            |Pointer tới các node khác (level trung bình).        |
+|Hash Table Entry     |~32 bytes            |Để tra cứu O(1) từ member ra score.                  |
+|Redis Object Overhead|~16 bytes            |Metadata của Redis cho mỗi object.                   |
+|Tổng cộng            |~96 - 104 bytes      |Tùy vào phiên bản Redis và cấu hình hệ thống.        |
+
+**Cách B: Bloom Filter (Nếu RAM là vấn đề)**
+
+Nếu có hàng tỷ user và không muốn tốn nhiều RAM, có thể dùng Bloom Filter. Tuy nhiên, Bloom Filter nguyên bản không hỗ trợ xóa, nên sẽ phải dùng Counting Bloom Filter hoặc đơn giản là tạo một cái Filter mới mỗi tuần và xóa Filter cũ.
+
+**Cách C: Redis Key Expiration (Cần thận trọng)**
+
+Có thể set mỗi user là một key riêng lẻ: active:user_123 với TTL 7 ngày.
+- Ưu điểm: Tự động xóa.
+- Nhược điểm: Không thể dùng SINTER hay SISMEMBER hàng loạt hiệu quả bằng việc check trong 1 Set duy nhất.
+
+
+#### 5. Cơ Chế Catch-up: Khi user Cũ Lâu Ngày Quay Lại
+Đây là phần quan trọng để đảm bảo trải nghiệm người dùng không bị "hổng". Khi một user mở app sau 10 ngày (đã bị xóa khỏi Global Active Set):
+
+1. **Check:** ZSCORE global:active_users <user_id> trả về nil.
+2. Kích hoạt Catch-up:
+    - Thêm lại vào Set: ZADD global:active_users <now> <user_id>.
+    - Đẩy một Job: CatchUpFeedJob.perform_async(user_id)
+3. CatchUpFeedJob: xử lý "Pull" dữ liệu bù. Job này đóng vai trò "vá" lại những lỗ hổng dữ liệu cho các User Loại B hoặc bài viết của Siêu sao (Celebrity) bị bỏ qua không Fan-out lúc đầu.
+```ruby
+# app/workers/catch_up_feed_job.rb
+class CatchUpFeedJob
+  include Sidekiq::Worker
+  sidekiq_options queue: 'fanout_low', retry: 1
+
+  def perform(user_id)
+    user = User.find(user_id)
+
+    # 1. Tìm IDs những người user này đang follow
+    following_ids = Follower.where(followed_by_user_id: user_id).pluck(:user_id)
+    return if following_ids.empty?
+
+    # 2. Pull bài mới của họ trong 7 ngày qua
+    # Chúng ta chỉ lấy tối đa ví dụ 100 bài mới nhất để tránh ngập lụt inbox
+    recent_post_ids = Post.where(user_id: following_ids)
+                          .where("created_at > ?", 7.days.ago)
+                          .order(created_at: :desc)
+                          .limit(100)
+                          .pluck(:id)
+
+    # 3. Chèn bù vào user_feeds (Sử dụng lại logic SQL thuần đã viết ở PushToFeedJob)
+    if recent_post_ids.any?
+      values = recent_post_ids.map { |p_id| "(#{user_id}, #{p_id})" }.join(",")
+
+      sql = <<-SQL
+        INSERT INTO user_feeds (user_id, post_id)
+        VALUES #{values}
+        ON CONFLICT (user_id, post_id) DO NOTHING;
+      SQL
+
+      ActiveRecord::Base.connection.execute(sql)
+    end
+  end
+end
+```
+
+#### 6. Cơ Chế Fallback (The Pull Model)
 Khi một User Loại B quay lại App (vượt qua ngưỡng 7 ngày), API lấy Feed sẽ phải làm thêm một bước:
 - Bước 1: Lấy bài từ user_feeds (đã được fan-out trước đó).
 - Bước 2: Query trực tiếp bảng posts của những người họ follow nhưng có created_at nằm trong khoảng thời gian họ "vắng mặt".
@@ -773,7 +890,13 @@ Giải pháp: **Hybrid Fanout**
 | Normal user | fan-out on write |
 | Celebrity   | fan-out on read  |
 ```
-
+Pseudo logic
+```
+if author.is_celebrity
+    fanout_on_read
+else
+    fanout_on_write
+```
 Khi đọc feed:
 ```
 feed_table
@@ -781,7 +904,7 @@ feed_table
 celebrity_posts
 ```
 
-# 6. Feed Cache
+## v6 - Feed Cache
 
 Feed là read-heavy.
 ```
@@ -809,7 +932,7 @@ Latency:
 < 1ms
 ```
 
-# 7. Ranking System
+## v7 - Ranking System
 
 Feed không còn chronological nữa.
 
@@ -836,7 +959,7 @@ Thường dùng
 - feature store
 - batch scoring
 
-# 8. Real-time Feed Streaming
+## v8 - Real-time Feed Streaming
 
 Feed update real-time.
 
