@@ -7,6 +7,176 @@
 # Note
 Đừng over-engineer pagination
 
+# Tech
+- Postgres 9.5, Rails, Redis
+- Trong các table minh họa bên dưới sẽ dùng kiểu `bigint` để làm id
+
+# Sharding (Optional)
+
+1\. Hiện tại: BigInt + Postgres 9.5 (Lựa chọn tối ưu)
+  - Xác nhận: Với bảng đơn (single database), BigInt tự tăng là "vô địch" về hiệu suất. Phân trang cursor hoạt động hoàn hảo vì tính tuần tự (monotonic) và index trên BigInt cực kỳ nhẹ.
+  - Lợi thế: Không tốn thêm tài nguyên cho việc tạo ID, và Postgres 9.5 xử lý kiểu số này nhanh nhất có thể.
+
+2\. Tương lai: Khi làm Sharding (Vấn đề ID trùng)
+  - Xác nhận: BigInt tự tăng của từng shard sẽ gây xung đột ID khi cần gộp dữ liệu hoặc làm Global Index.
+  - Giải pháp Ticket Server: Đây là cách Flickr và Instagram (thời kỳ đầu) đã dùng. Có một DB riêng chỉ để sinh ID.
+    - Ưu điểm: ID vẫn là BigInt, ngắn gọn, dễ sort.
+    - Nhược điểm: Ticket Server trở thành Single Point of Failure (SPOF). Nếu nó sập, cả hệ thống không insert được bài mới.
+  - Giải pháp Snowflake (Twitter): Sinh ID 64-bit dựa trên (Timestamp + WorkerID + Sequence):
+    - Ưu điểm: Không cần server trung tâm, ID vẫn mang tính thời gian (sort được).
+    - Nhược điểm: Cần duy trì một service sinh ID ổn định.
+
+3\. Vấn đề UUID v7 trên Postgres 9.5
+  - Hiệu năng của UUID v7 trên bản 9.5 chưa tốt.
+  - Lưu trữ: Postgres 9.5 chưa có các hàm xử lý UUID tối ưu như các bản 13+. UUID v7 chiếm 128 bit (16 bytes), gấp đôi BigInt (8 bytes). Điều này làm Index phình to hơn, dẫn đến tốn RAM cho Buffer Cache hơn.
+  - Sắp xếp (Sorting): Mặc dù UUID v7 được thiết kế để có thể sắp xếp theo thời gian (time-ordered), nhưng Postgres 9.5 không "biết" điều này. Nó sẽ so sánh byte-by-byte. So sánh 16 bytes chậm hơn so sánh một số nguyên 8 bytes ở mức CPU.
+  - Chưa native: Phải tự implement hàm sinh UUID v7 ở tầng Application (Ruby) hoặc dùng extension, điều này làm phức tạp thêm việc duy trì code.
+
+4\. DB Evolution
+|Giai đoạn            |Giải pháp ID   |Đánh giá                                             |
+|---------------------|---------------|-----------------------------------------------------|
+|Hiện tại (MVP -> Scale)|BigInt (Postgres Serial)|Tốt nhất cho Postgres 9.5. Hiệu suất tối đa.         |
+|Sắp Sharding         |Snowflake ID   |Giữ được kiểu dữ liệu BigInt (64-bit) nhưng vẫn đảm bảo duy nhất trên toàn hệ thống.|
+|Nâng cấp Postgres 17+|UUID v7        |Lúc này hạ tầng đã đủ mạnh để bù đắp cho sự "cồng kềnh" của UUID, đổi lấy sự tiện lợi tuyệt đối.|
+
+5\. Sample SnowflakeGenerator
+
+Cấu trúc Snowflake ID thường là 64-bit:
+```
+1 bit: Dự phòng (luôn là 0). Vì 0 sẽ ra số dương, còn 1 ra số âm.
+
+41 bits: Timestamp (miligiây) - dùng được khoảng 69 năm.
+
+10 bits: Worker ID (tối đa 1024 shard/node).
+
+12 bits: Sequence number (tối đa 4096 ID/mili giây trên mỗi node).
+```
+**Lưu ý: Cách gán WORKER_ID thực tế**
+
+1\. Gán thủ công (Static):
+- Server 1: export WORKER_ID=1
+- Server 2: export WORKER_ID=2
+- ... Cách này dễ làm nhưng khó quản lý khi bạn dùng Auto-scaling (server tự sinh thêm/xóa bớt).
+
+2\. Dùng Redis/ZooKeeper (Dynamic):
+
+Khi App khởi động, nó sẽ "đăng ký" với Redis để lấy một ID trống.
+
+Ví dụ: Server mới lên, hỏi Redis: "Số nào chưa ai dùng?". Redis trả về 5. Server đó sẽ giữ WORKER_ID=5 trong suốt vòng đời của nó.
+
+3\.Dùng Private IP:
+
+Lấy byte cuối cùng của địa chỉ IP nội bộ (ví dụ: 10.0.0.15 -> 15) để làm WORKER_ID. Đây là cách rất phổ biến vì nó tự động và không trùng trong cùng một mạng.
+
+```ruby
+# lib/snowflake_id_generator.rb
+class SnowflakeIdGenerator
+  # Epoch cho dự án: 2026-01-01 00:00:00 UTC
+  # (Time.utc(2026, 1, 1).to_f * 1000).to_i
+  # Bạn nên chọn mốc thời gian gần với lúc bắt đầu dự án
+  EPOCH = 1735689600000
+
+  # Cố định các mốc bit
+  UNUSED_BITS = 1 # 1 bit đầu tiên không dùng (để luôn dương)
+  WORKER_BITS  = 10 # Tối đa 1024 workers
+  SEQ_BITS     = 12 # Tối đa 4096 IDs/ms
+
+  MAX_WORKER_ID = (1 << WORKER_BITS) - 1 # 1023
+
+  def initialize(worker_id)
+    if worker_id < 0 || worker_id > MAX_WORKER_ID
+      raise "Worker ID phải nằm trong khoảng 0-#{MAX_WORKER_ID}"
+    end
+    @worker_id = worker_id
+    @sequence = 0
+    @last_timestamp = -1
+    @mutex = Mutex.new
+  end
+
+  def next_id
+    @mutex.synchronize do
+      timestamp = current_timestamp
+      # Xử lý khi trùng mili giây
+      if timestamp == @last_timestamp
+        @sequence = (@sequence + 1) & 0xFFF # Giữ trong 12 bit
+        if @sequence == 0
+          timestamp = wait_for_next_millis(@last_timestamp)
+        end
+      else
+        @sequence = 0
+      end
+
+      @last_timestamp = timestamp
+
+      # Dịch bit để tạo cấu trúc Snowflake
+      # Bit 63 (dự phòng) sẽ tự động là 0 vì chúng ta không dịch chuyển tới đó
+      ((timestamp - EPOCH) << (WORKER_BITS + SEQ_BITS)) |
+      (@worker_id << SEQ_BITS) |
+      @sequence
+    end
+  end
+
+  private
+
+  def current_timestamp
+    (Time.now.to_f * 1000).to_i
+  end
+
+  def wait_for_next_millis(last)
+    ts = current_timestamp
+    ts = current_timestamp while ts <= last
+    ts
+  end
+end
+```
+
+```ruby
+# app/models/post.rb
+class Post < ActiveRecord::Base
+  before_create :set_snowflake_id
+
+  private
+
+  def set_snowflake_id
+    # Trong thực tế, bạn nên dùng một Singleton hoặc Service để quản lý Generator
+    # Worker ID có thể lấy từ biến môi trường (ENV['WORKER_ID'])
+    @generator ||= SnowflakeIdGenerator.new(ENV['WORKER_ID'].to_i)
+    self.id = @generator.next_id if self.id.blank?
+  end
+end
+```
+Hoặc
+```ruby
+# config/initializers/snowflake.rb
+require 'snowflake_id_generator'
+
+# Kết nối Redis (tùy biến theo cấu hình của bạn)
+redis = Redis.new(host: 'localhost', port: 6379)
+
+# Lấy số thứ tự từ Redis và modulo 1024
+# Mỗi lần restart hoặc có web server mới, nó sẽ lấy số tiếp theo
+raw_id = redis.incr("nova:global_worker_counter")
+assigned_worker_id = raw_id % 1024
+
+# Khởi tạo một biến toàn cục hoặc hằng số để dùng trong toàn App
+SNOWFLAKE_GEN = SnowflakeIdGenerator.new(assigned_worker_id)
+
+Rails.logger.info "Snowflake Generator initialized with Worker ID: #{assigned_worker_id}"
+
+# app/models/post.rb
+class Post < ActiveRecord::Base
+  # Rails 4.x: Sử dụng callback để gán ID trước khi chèn vào DB
+  before_create :assign_snowflake_id
+
+  private
+
+  def assign_snowflake_id
+    # SNOWFLAKE_GEN được khởi tạo từ initializer ở trên
+    self.id ||= SNOWFLAKE_GEN.next_id
+  end
+end
+```
+
 # Feed Storage Evolution
 ## V1 - Global Feed
 
