@@ -417,6 +417,173 @@ Khi một User Loại B quay lại App (vượt qua ngưỡng 7 ngày), API lấ
 - Bước 2: Query trực tiếp bảng posts của những người họ follow nhưng có created_at nằm trong khoảng thời gian họ "vắng mặt".
 - Bước 3: Merge và trả về kết quả.
 
+#### 7. Feed Api Sample
+API:
+```
+GET /feed?since={since}&cursor={cursor}
+```
+
+json response:
+```
+{
+  meta: {
+    current_cursor: ...,
+    current_since: ...,
+    next_cursor: ...
+  }
+  data: {
+    new_post: [...],
+    old_post: [...]
+  }
+}
+```
+Sample ruby code
+```ruby
+class FeedRetrievalService
+  PER_PAGE = 20
+
+  def initialize(user:, since_id: nil, cursor_id: nil)
+    @user = user
+    @since_id = since_id.to_i if since_id.present?
+    @cursor_id = cursor_id.to_i if cursor_id.present?
+  end
+
+  def call
+    # 1. Update last_active_at và trigger Catch-up nếu cần
+    handle_user_activity
+
+    # 2. Query lấy data
+    # posts là 1 array [ { id: ..., content: ..., user_id: ... }, ... ]
+    posts = fetch_new_posts + fetch_older_posts
+    {
+      meta: {
+        # ID thực tế cuối cùng trong DB để load more, chính là cursor_id
+        # Server luôn trả về next_cursor là ID vật lý cuối cùng đã quét qua trong DB (kể cả khi bài đó bị lọc) để App không bị mất dấu cursor.
+        next_cursor: 85,
+        # ID lớn nhất trong list để check bài mới (polling), chính là since_id
+        prev_cursor: 100
+      },
+      data: posts
+    }
+  end
+
+  private
+
+  def handle_user_activity
+    if @user.last_active_at < 7.days.ago
+      CatchUpFeedJob.perform_async(@user.id)
+    end
+    @user.update_column(:last_active_at, Time.current)
+  end
+
+  def fetch_new_posts
+    return [] unless @since_id
+
+    # Lấy những bài mới hơn since_id
+    base_query.where("posts.id > ?", @since_id)
+              .order("posts.id DESC")
+              .limit(PER_PAGE).to_a
+  end
+
+  def fetch_older_posts
+    query = base_query.order("posts.id DESC").limit(PER_PAGE)
+
+    # Nếu có cursor_id thì lấy cũ hơn cursor, nếu không lấy mới nhất
+    if @cursor_id
+      query = query.where("posts.id < ?", @cursor_id)
+    end
+
+    query.to_a
+  end
+
+  def base_query
+    Post.joins("INNER JOIN user_feeds ON user_feeds.post_id = posts.id")
+        .where("user_feeds.user_id = ?", @user.id)
+        .select("posts.*")
+  end
+end
+```
+
+#### 8. Nhận xét
+Với mô hình này, hệ thống của sẽ cực kỳ lì lợm:
+- Lúc thấp điểm: Mọi thứ chạy trơn tru.
+- Lúc cao điểm (Celebrity đăng bài): Thay vì fan-out cho 1 triệu người, hệ thống chỉ "vất vả" với 100k người thực sự đang online. 900k người còn lại sẽ tự "kéo" dữ liệu khi họ mở app sau. Tải trọng DB được dàn trải ra theo thời gian (Time-shifting), tránh được hiện tượng "DB Spike" (vọt đỉnh) gây sập hệ thống.
+
+
+### V4.2 - Cơ Chế Follow/Unfollow
+Áp dụng cơ chế Eventual Consistency (nhất quán sau một khoảng thời gian) hơn là cố gắng đạt được Real-time Consistency một cách cực đoan.
+
+Để "chiều lòng" những user kỹ tính mà vẫn giữ hệ thống nhẹ, có thể theo hướng "xóa nhanh những gì dễ thấy nhất":
+```ruby
+# app/workers/unfollow_shallow_cleanup_job.rb
+class UnfollowShallowCleanupJob
+  include Sidekiq::Worker
+  sidekiq_options queue: 'low_priority', retry: 1
+
+  def perform(follower_id, followed_id)
+    # Tìm 50 bài gần nhất của Author trong inbox của User A
+    # Phép join này chỉ quét trên tập dữ liệu nhỏ nhờ LIMIT
+    target_post_ids = Post.joins(:user_feeds)
+                          .where(user_id: followed_id)
+                          .where(user_feeds: { user_id: follower_id })
+                          .order("posts.id DESC")
+                          .limit(50)
+                          .pluck(:id)
+
+    if target_post_ids.any?
+      UserFeed.where(user_id: follower_id, post_id: target_post_ids).delete_all
+    end
+  end
+end
+```
+
+### V4.3 - Cơ Chế Chống Click Spam
+Nếu có user liên tục toggle Follow/Unfollow và ta cố gắng cực đoan đi xóa user_feeds thì chỉ làm stress DB
+
+Có thể dùng cơ chế Rate Limit đơn giản
+```ruby
+# app/controllers/concerns/rate_limit_protection.rb
+module RateLimitProtection
+  extend ActiveSupport::Concern
+
+  def check_rate_limit(action_name, limit: 10, period: 60)
+    # Tạo key duy nhất cho mỗi user và mỗi hành động
+    # Ví dụ: rate_limit:follow:user_123
+    key = "rate_limit:#{action_name}:#{current_user.id}"
+
+    # Sử dụng Redis Pipelining để giảm round-trip
+    count, ttl = $redis.pipelined do
+      $redis.incr(key)
+      $redis.ttl(key)
+    end
+
+    # Nếu là request đầu tiên (TTL = -1), set thời gian hết hạn
+    $redis.expire(key, period) if ttl < 0
+
+    if count > limit
+      render json: {
+        error: "Bạn thao tác quá nhanh. Vui lòng thử lại sau #{ttl} giây."
+      }, status: 429
+      return false
+    end
+    true
+  end
+end
+
+class FollowsController < ApplicationController
+  include RateLimitProtection
+
+  # Chỉ áp dụng cho các hành động thay đổi trạng thái (POST/DELETE)
+  before_action only: [:create, :destroy] do
+    check_rate_limit("follow_toggle", limit: 5, period: 60)
+  end
+
+  def create
+    # Logic follow ở đây...
+  end
+end
+```
+
 ## v5 - Celebrity Problem
 
 Nếu user có:
