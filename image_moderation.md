@@ -923,7 +923,10 @@ Multi-prefix: search 8 shards → 1500 * 8 = 12k rows
 
 So với full scan: 100M rows → nhanh hơn ~8000 lần.
 
-## 14. Future Improvements
+## 14. LSH (optional)
+Giải pháp này khá over engineering, sẽ không được viết doc lại, chỉ note lại để khi cần sẽ research lại.
+
+## 15. Future Improvements
 
 Có thể mở rộng sau:
 ```
