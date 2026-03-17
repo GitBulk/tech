@@ -1,5 +1,16 @@
 # Image Moderation System – Design v1.0
 
+## Roadmap
+```
+v1.0 - Postgres + pHash + AI moderation
+v1.1 - pHash prefix sharding
+v1.2 - multi-prefix search
+v1.3 - LSH index
+v1.4 - ban propagation
+v1.5 - abuse report graph
+v2.0 - vector similarity search
+```
+
 ## 1. Mục tiêu
 
 Hệ thống moderation nhằm:
@@ -628,7 +639,291 @@ def predict(img):
   return 0.2
 ```
 
-## 12. Future Improvements
+## 12. pHash Prefix
+pHash = 64 bits. Ví dụ:
+```
+phash = 0x9f1234abcd998877
+```
+Binary:
+```
+100111110001001000110100...
+```
+
+Tạ chọn 16 bit đầu là prefix, prefix = 16 bits đầu:
+```
+1001111100010010
+```
+→ convert sang decimal: 40722
+```ruby
+def phash_prefix(phash)
+  phash >> 48
+end
+```
+Vì:
+```
+64 bits
+shift 48
+= giữ lại 16 bits
+```
+
+Python service trả: phash_hex
+
+```ruby
+class ModerateImageJob
+  include Sidekiq::Worker
+
+  def perform(image_id)
+
+    image = Image.find(image_id)
+
+    result = ModerationClient.check(image.s3_url)
+
+    phash_int = result["phash_hex"].to_i(16)
+
+    image.update!(
+      phash: phash_int,
+      phash_prefix: phash_int >> 48,
+      nsfw_score: result["nsfw_score"],
+      status: result["status"]
+    )
+
+  end
+end
+```
+
+Tiến hành Near-duplicate search
+
+Giả sử ảnh mới có: phash = 1234567890123
+```sql
+SELECT *
+FROM images
+WHERE phash_prefix = ?
+AND bit_count(phash # ?) <= 5
+```
+
+```ruby
+def find_near_duplicates(phash)
+  prefix = phash >> 48
+  Image.where(phash_prefix: prefix).where("bit_count(phash # ?) <= 5", phash)
+end
+```
+
+Lợi ích cực lớn
+
+Nếu bạn có: 100M images
+-> full scan 100M comparisons
+
+Với prefix shard:
+```
+100M / 65536
+≈ 1500 comparisons
+```
+nhanh hơn ~60,000 lần.
+
+Query flow
+```
+new image
+    │
+compute phash
+    │
+prefix = phash >> 48
+    │
+DB filter prefix
+    │
+Hamming distance check
+```
+
+## 13. multi-prefix search (v1.2)
+Nếu hai tấm ảnh cực kỳ giống nhau nhưng chỉ khác nhau đúng 1 bit ở vị trí thứ 16 (làm đổi prefix), chúng sẽ rơi vào 2 bucket khác nhau và hàm find_near_duplicates sẽ bỏ sót chúng.
+
+Ta đang dùng:
+```
+phash_prefix = phash >> 48
+```
+tức là 16 bit đầu của phash làm prefix
+
+Ví dụ 2 ảnh gần giống:
+```
+phash A
+10101010 11110000 01010101 ...
+
+phash B
+10101011 11110000 01010101 ...
+```
+Ta cho phép:
+
+Hamming distance ≤ 5
+
+Nhưng:
+```
+prefix A = 10101010 11110000
+prefix B = 10101011 11110000
+```
+→ prefix khác nhau
+
+Khi Query:
+```sql
+WHERE phash_prefix = $prefix
+```
+→ miss duplicate.
+
+Đây là false negative rất phổ biến.
+
+Ý tưởng của Multi-Prefix Search
+
+Thay vì search 1 prefix, ta search nhiều prefix gần nhau.
+
+Tức là:
+```
+prefix
+prefix XOR mask1
+prefix XOR mask2
+prefix XOR mask3
+...
+```
+Vì Hamming distance ≤ 5 nghĩa là:
+
+có tối đa 5 bit khác nhau
+
+Những bit khác nhau có thể nằm trong prefix 16 bit.
+
+Ví dụ cụ thể
+
+Prefix của ảnh mới: 10101010 11110000
+Decimal: 43760
+
+Giả sử ta flip 1 bit:
+```
+mask1 = 00000000 00000001
+mask2 = 00000000 00000010
+mask3 = 00000000 00000100
+...
+```
+
+Các prefix cần search:
+```
+prefix
+prefix XOR mask1
+prefix XOR mask2
+prefix XOR mask3
+...
+```
+Ví dụ:
+```
+43760
+43761
+43762
+43764
+...
+```
+
+Đới với Postgres 9.5 thì cần tạo Function trước
+```ruby
+
+class AddPopcount64Function < ActiveRecord::Migration
+  def up
+    execute <<~SQL
+      CREATE OR REPLACE FUNCTION popcount64(i bigint)
+      RETURNS integer AS $$
+        -- LANGUAGE sql giúp Postgres inline function vào hàm chính để tăng tốc độ.
+        -- Dùng CASE để xử lý trường hợp i là NULL nếu cần,
+        -- nhưng với IMMUTABLE và logic này thì SELECT là đủ.
+        SELECT length(replace((i::bit(64))::text, '0', ''))::integer;
+      $$ LANGUAGE sql IMMUTABLE STRICT;
+    SQL
+  end
+
+  def down
+    execute <<~SQL
+      DROP FUNCTION IF EXISTS popcount64(bigint);
+    SQL
+  end
+end
+```
+
+LANGUAGE SQL vs LANGUAGE PL/pgSQL
+
+|Đặc điểm   |LANGUAGE SQL                         |LANGUAGE PL/pgSQL                           |
+|-----------|-------------------------------------|--------------------------------------------|
+|Cấu trúc   |Chỉ gồm các câu lệnh SQL             |Có DECLARE, BEGIN...END, IF, LOOP           |
+|Tốc độ     |Nhanh hơn cho các phép toán nhỏ      |Chậm hơn một chút do chi phí vận hành       |
+|Tối ưu hóa |Có thể Inlining (như copy-paste code)|Không thể Inlining                          |
+|Phù hợp với|Chuyển đổi dữ liệu, toán học đơn giản|Logic nghiệp vụ, kiểm tra điều kiện phức tạp|
+
+```ruby
+class Image < ApplicationRecord
+  # PREFIX_MASKS = [
+  #   0,
+  #   1 << 0,
+  #   1 << 1,
+  #   1 << 2,
+  #   1 << 3,
+  #   1 << 4,
+  #   1 << 5,
+  #   1 << 6
+  # ].freeze
+
+  # ta tối ưu hơn bằng cách tính trước kết quả, thay vì dịch bit lúc runtime
+  PREFIX_MASKS = [
+    0,
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64
+  ].freeze
+
+  HAMMING_THRESHOLD = 5
+
+  def self.find_near_duplicates_robust(phash)
+    prefix = phash >> 48
+    prefixes = PREFIX_MASKS.map { |m| prefix ^ m }
+
+    where(phash_prefix: prefixes)
+      .where("popcount64(phash # ?) <= ?", phash, HAMMING_THRESHOLD)
+      .order("popcount64(phash # #{phash}) ASC")
+      .limit(100)
+  end
+
+  def s3_url
+    "https://#{ENV['S3_BUCKET']}.s3.amazonaws.com/#{s3_key}"
+  end
+end
+```
+
+```sql
+WHERE phash_prefix IN (...)
+AND popcount64(phash, target) <= 5
+```
+
+Trade-off:
+```
+| prefix count | recall  | cost      |
+| ------------ | ------- | --------- |
+| 1            | thấp    | rất nhanh |
+| 4            | khá     | nhanh     |
+| 8            | tốt     | vẫn nhanh |
+| 16           | rất tốt | hơi nặng  |
+```
+Production thường dùng: 8 – 16 prefixes
+
+Ví dụ thực tế
+
+Giả sử hệ thống có: 100M images
+
+Prefix shard:
+```
+100M / 65536
+≈ 1500 images per shard
+```
+
+Multi-prefix: search 8 shards → 1500 * 8 = 12k rows
+
+So với full scan: 100M rows → nhanh hơn ~8000 lần.
+
+## 14. Future Improvements
 
 Có thể mở rộng sau:
 ```
@@ -636,18 +931,4 @@ vector embedding
 cropped image detection
 ```
 
-## 13. Versioning Roadmap
-```
-v1.0
-Postgres + pHash + AI moderation
-
-v1.1
-pHash prefix sharding
-
-v1.2
-robust perceptual hashing
-
-v2.0
-vector similarity search
-```
 End of document.
