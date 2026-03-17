@@ -926,7 +926,65 @@ So với full scan: 100M rows → nhanh hơn ~8000 lần.
 ## 14. LSH (optional)
 Giải pháp này khá over engineering, sẽ không được viết doc lại, chỉ note lại để khi cần sẽ research lại.
 
-## 15. Future Improvements
+## 15. v1.4 - Ban Propagation
+### Giai đoạn 1: Manual Focus (An toàn là trên hết)
+Trọng tâm: AI chỉ đóng vai trò "gợi ý", Admin giữ quyền quyết định cuối cùng để tránh sai số pHash.
+
+1. **User Upload:** User tải ảnh lên $\rightarrow$ Hệ thống lưu ảnh với status :processing.
+2. **AI Analysis:** Sidekiq gửi ảnh sang AI service $\rightarrow$ Nhận về pHash.
+3. **Near-Duplicate Check:** Tìm các ảnh đang hoạt động `status == 'active' AND d <= 5`
+4. Admin Action (The Trigger):
+    - Admin vào Dashboard, thấy ảnh A vi phạm $\rightarrow$ Nhấn BAN.
+    - Hệ thống đánh dấu A là root_id (banned_by_propagation_from_id: nil).
+5. Manual Propagation:
+    - Ngay khi Admin nhấn Ban A, một Worker sẽ quét tìm ảnh (`status in ('active', 'pending')`) tương đồng với A ($d \le 5$).
+    - Các ảnh này sẽ bị đổi thành status: :banned và gắn banned_by_propagation_from_id: A.
+
+### Giai đoạn 2: Hybrid Automation (Tối ưu hiệu suất)
+Trọng tâm: Tự động hóa hoàn toàn với các bản sao tuyệt đối ($d=0$), kết hợp "Cầu dao" (Circuit Breaker) để bảo vệ hệ thống.
+1. **User Upload & AI Analysis:** (Giống giai đoạn 1) $\rightarrow$ Có được pHash của ảnh mới.
+2. **Instant Blacklist Check ($d=0$):** Hệ thống tìm các root_id đã bị ban có $pHash$ khớp tuyệt đối ($d=0$).
+3. **Circuit Breaker (Chốt chặn):**
+    - Nếu tìm thấy Root: Kiểm tra bảng moderation_stats của Root đó.
+    - Dưới ngưỡng (< 500): Tự động Ban ảnh mới $\rightarrow$ Gắn moderated_by: 'system_ai' và tăng biến đếm propagation_count.
+    - Vượt ngưỡng ($\ge 500$): "Ngắt cầu dao". Không ban tự động nữa $\rightarrow$ Đẩy vào danh sách Urgent Review để Admin kiểm tra xem có đang bị ban nhầm hàng loạt không.
+4. Near-Duplicate ($1 \le d \le 5$): Vẫn giữ nguyên cơ chế Giai đoạn 1 (Gắn cờ chờ Admin duyệt) vì độ lệch này chưa đủ tin cậy để máy tự quyết.
+
+### Sample implementation
+```sql
+Add table moderation_stats: root_image_id (bigint), propagation_count (integer), is_locked (boolean)
+```
+
+```ruby
+def self.check_circuit_breaker(root_id)
+  stats = ModerationStat.find_or_create_by!(root_image_id: root_id)
+
+  return :locked if stats.is_locked || stats.propagation_count >= CB_THRESHOLD
+
+  :clear
+end
+
+def self.auto_ban_if_perfect_match(image)
+  # Tìm root gốc đã bị ban có d = 0
+  root_banned = Image.where(status: :banned, banned_by_propagation_from_id: nil)
+                     .where(phash_prefix: image.phash_prefix)
+                     .find_by("popcount64(phash # ?) = 0", image.phash)
+
+  return unless root_banned
+  return if check_circuit_breaker(root_banned.id) == :locked
+
+  Image.transaction do
+    image.update!(
+      status: :banned,
+      banned_by_propagation_from_id: root_banned.id,
+      moderated_by: 'system_ai'
+    )
+    ModerationStat.where(root_image_id: root_banned.id).increment_all(:propagation_count)
+  end
+end
+```
+
+## 16. Future Improvements
 
 Có thể mở rộng sau:
 ```
