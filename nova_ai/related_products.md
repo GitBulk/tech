@@ -92,7 +92,9 @@ end
 ```
 
 ### 1.1.1 Dùng Elasticsearch để lưu trữ Products
-Phần code demo bên dưới dùng trong ES 2.4.6
+Nếu Postgres chỉ biết lọc "cứng" (Đúng danh mục, Đúng khoảng giá), thì ES sử dụng thuật toán (BM25) để đếm tần suất từ khóa -> dùng filter more_like_this để tìm các sản phẩm có chữ trong name và description giống với sản phẩm hiện tại nhất.
+
+Ruby + ES 2.4.6
 ```ruby
 # app/models/concerns/product_indexable.rb
 # frozen_string_literal: true
@@ -365,6 +367,51 @@ Benchmark.bm(30) do |x|
     end
   end
 end
+```
+
+### 1.1.2 Alias trong ES
+Trong ES, các thông số phần cứng cốt lõi như number_of_shards (số lượng phân mảnh) và analyzer (bộ phân tích ngôn ngữ) mang tính Bất biến (Immutable). Nghĩa là một khi Index đã được tạo ra, ta KHÔNG THỂ thay đổi số Shards của nó.
+
+Với 20k sản phẩm: 1 Shard là hoàn hảo để tối ưu tốc độ và độ chính xác.
+```
+number_of_shards: 1,
+number_of_replicas: 0
+```
+
+Nếu lên 1 triệu sản phẩm: 1 Shard sẽ trở thành nút thắt cổ chai (bottleneck) gây chậm hệ thống, bắt buộc phải tăng lên 3 hoặc 5 Shards.
+
+**Giải pháp: Sử dụng Alias (Bí danh)**
+
+Thay vì để code Rails kết nối trực tiếp vào tên thật của Index (ví dụ: nova_products_v1), chúng ta tạo một Alias tên là nova_products và trỏ nó vào Index thật. Code Rails chỉ giao tiếp với Alias này.
+
+**Lợi ích sống còn của Alias đối với hệ thống của chúng ta:**
+
+Nâng cấp hạ tầng Zero-Downtime (Không gián đoạn):
+Khi cần tăng từ 1 Shard lên 5 Shards, chúng ta không cần sửa code Rails hay khởi động lại Web Server. Tiến trình diễn ra hoàn toàn ngầm bên dưới:
+- Tạo Index mới nova_products_v2 (với 5 Shards).
+- Copy dữ liệu từ v1 sang v2 (Reindex).
+- Đảo hướng Alias từ v1 sang v2 trong nháy mắt (Atomic switch). User không hề hay biết sự thay đổi này.
+
+**Decoupling (Tách biệt Code và Hạ tầng):**
+
+Code của app (ProductIndexable) chỉ cần biết một cái tên duy nhất là nova_products. Việc hôm nay ES dùng bản v1, ngày mai dùng v5 hay v10 là chuyện của DevOps/Data Engineer, Developer không cần bận tâm.
+
+An toàn tuyệt đối (Instant Rollback):
+Giả sử chúng ta nâng cấp lên v2 nhưng phát hiện ra cấu hình analyzer bị lỗi khiến khách hàng không tìm thấy sản phẩm. Nếu không có Alias, chúng ta sẽ phải copy lại dữ liệu từ đầu rất lâu. Với Alias, ta chỉ cần 1 câu lệnh để trỏ ngược Alias về lại v1 ngay lập tức. Hệ thống được cứu sống trong vòng 1 giây.
+
+Kết luận: Nên dùng Alias để xây dựng một Search Engine có khả năng mở rộng và chịu lỗi cao.
+
+```ruby
+module ProductIndexable
+  extend ActiveSupport::Concern
+
+  included do
+    include Elasticsearch::Model
+
+    # Định nghĩa tên index (có thể thêm env)
+    # LUÔN TRỎ VÀO ALIAS
+    index_name 'nova_products'
+    ...
 ```
 
 ### 1.2. Thống kê hành vi (Co-occurrence Logic)
