@@ -442,6 +442,158 @@ module ProductIndexable
 - **Giải pháp:** Chạy **Rake Task** hàng đêm để thống kê tần suất các cặp sản phẩm xuất hiện cùng nhau trong bảng `LineItems`. Lưu kết quả vào bảng trung gian `related_products_cache`.
 - **Ưu điểm:** Không làm chậm DB chính khi khách hàng đang mua sắm.
 
+```ruby
+class CreateProductDependencies < ActiveRecord::Migration
+  def change
+    create_table :product_dependencies do |t|
+      t.integer :product_id, null: false      # Sản phẩm gốc (A)
+      t.integer :related_id, null: false      # Sản phẩm liên quan (B)
+      t.integer :score, default: 0            # Số lần xuất hiện cùng nhau
+      t.timestamps null: false
+    end
+
+    # Index cực kỳ quan trọng để truy vấn thần tốc
+    add_index :product_dependencies, [:product_id, :score]
+  end
+end
+```
+
+Phần setup recommendation data bên dưới dùng kỹ thuật blue-green view. Khi bảng recommendation có hàng triệu dòng và ta không muốn clear cache schema trong rails hay thậm chí phải restart app.
+
+ Tưởng tượng có 2 cái bàn (2 bảng thật):
+- Bảng xanh (green): đang được khách hàng dùng
+- Bảng xanh dương (blue): đang “ẩn” (không ai dùng)
+
+Mỗi lần chạy rake task:
+- Tính toán dữ liệu mới → bỏ vào bàn đang ẩn (blue)
+- Đổi tên biển hiệu: giờ “bàn chính” trỏ sang bàn blue
+- Bàn xanh cũ trở thành bàn ẩn (sẽ xóa sau)
+- → Khách hàng không bao giờ thấy bàn trống, và Rails không cần clear cache vì nó luôn query cùng một tên bảng.
+
+Chúng ta sẽ có 3 thứ:
+- Hai bảng thật (luôn tồn tại): product_dependencies_blue, product_dependencies_green
+- Một VIEW tên product_dependencies (đây là “biển hiệu” mà Rails query)
+- Một bảng nhỏ recommendation_configs (chỉ 1 dòng) để ghi nhớ đang dùng blue hay green.
+
+```ruby
+class ProductDependency < ApplicationRecord
+  # Luôn query qua VIEW, không cần thay đổi gì cả
+  self.table_name = 'product_dependencies'
+end
+
+# lib/tasks/recommendation.rake
+namespace :recommendation do
+  # ===================== SETUP LẦN ĐẦU (CHẠY 1 LẦN) =====================
+  task setup_blue_green: :environment do
+    conn = ActiveRecord::Base.connection
+    puts 'Đang setup blue-green cho recommendation...'
+
+    # Tạo 2 bảng thật
+    conn.execute("DROP TABLE IF EXISTS product_dependencies_blue;")
+    conn.execute("DROP TABLE IF EXISTS product_dependencies_green;")
+    conn.execute("CREATE TABLE product_dependencies_blue  (LIKE product_dependencies INCLUDING ALL);")
+    conn.execute("CREATE TABLE product_dependencies_green (LIKE product_dependencies INCLUDING ALL);")
+
+    # Copy dữ liệu hiện tại (nếu còn) vào blue
+    if conn.table_exists?('product_dependencies')
+      count = conn.select_value("SELECT COUNT(*) FROM product_dependencies")
+      if count.to_i > 0
+        conn.execute("INSERT INTO product_dependencies_blue SELECT * FROM product_dependencies;")
+        puts "✅ Đã copy #{count} dòng dữ liệu cũ vào blue"
+      end
+    end
+
+    # Tạo VIEW (biển hiệu mà Rails sẽ query)
+    conn.execute(<<-SQL)
+      CREATE OR REPLACE VIEW product_dependencies AS
+      SELECT * FROM product_dependencies_blue;
+    SQL
+
+    # Tạo bảng config (chỉ 1 dòng)
+    conn.execute("DROP TABLE IF EXISTS recommendation_configs;")
+    conn.execute(<<-SQL)
+      CREATE TABLE recommendation_configs (
+        key   varchar PRIMARY KEY,
+        value varchar NOT NULL
+      );
+    SQL
+
+    conn.execute("INSERT INTO recommendation_configs (key, value, last_computed_at) VALUES ('current_color', 'blue', now());")
+
+    puts "🎉 SETUP HOÀN TẤT! Bây giờ bạn có thể chạy:"
+    puts "   rails rec:compute_co_occurrence"
+    puts "   (không cần restart app, không lo cache)"
+  end
+
+  # ===================== COMPUTE (tính toán + swap) =====================
+  task compute_co_occurrence: :environment do
+    conn = ActiveRecord::Base.connection
+    current_color = conn.select_value("SELECT value FROM recommendation_configs WHERE key = 'current_color'")
+    next_color    = (current_color == 'blue') ? 'green' : 'blue'
+    next_table    = "product_dependencies_#{next_color}"
+
+    puts "Đang tính toán vào bàn #{next_color} (bàn ẩn)..."
+
+    # Xóa dữ liệu cũ trong bàn ẩn rồi tính mới
+    conn.execute("TRUNCATE #{next_table}")
+
+    insert_sql = <<-SQL
+      INSERT INTO #{next_table} (product_id, related_id, score, created_at, updated_at)
+      SELECT
+        a.product_id,
+        b.product_id as related_id,
+        COUNT(*) as score,
+        NOW(), NOW()
+      FROM line_items a
+      JOIN line_items b ON a.order_id = b.order_id
+      JOIN orders o ON o.id = a.order_id
+      WHERE a.product_id != b.product_id
+        AND o.status = 'completed'
+        AND o.created_at > NOW() - INTERVAL '6 months'
+      GROUP BY a.product_id, b.product_id
+      HAVING COUNT(*) >= 2
+    SQL
+
+    conn.execute(insert_sql)
+
+    # Swap bằng cách đổi VIEW (chỉ vài ms)
+    ActiveRecord::Base.transaction do
+      puts "Đang hoán đổi VIEW sang #{next_color}..."
+      conn.execute("CREATE OR REPLACE VIEW product_dependencies AS SELECT * FROM #{next_table};")
+      conn.execute("UPDATE recommendation_configs SET value = '#{next_color}' last_computed_at = now() WHERE key = 'current_color';")
+
+      # Xóa cache schema của Rails 4.2
+      # if defined?(ProductDependency)
+      #   ProductDependency.reset_column_information
+      #   ProductDependency.connection.schema_cache.clear!
+      # end
+    end
+    puts "HOÀN TẤT! Đã chuyển sang bàn #{next_color} - Zero downtime!"
+  end
+
+  # ===================== ROLLBACK =====================
+  task rollback_co_occurrence: :environment do
+    conn = ActiveRecord::Base.connection
+    current_color = conn.select_value("SELECT value FROM recommendation_configs WHERE key = 'current_color'")
+    previous_color = (current_color == 'blue') ? 'green' : 'blue'
+    previous_table = "product_dependencies_#{previous_color}"
+
+    ActiveRecord::Base.transaction do
+      conn.execute("CREATE OR REPLACE VIEW product_dependencies AS SELECT * FROM #{previous_table};")
+      conn.execute("UPDATE recommendation_configs SET value = '#{previous_color}', last_computed_at = now() WHERE key = 'current_color';")
+
+      # if defined?(ProductDependency)
+      #   ProductDependency.reset_column_information
+      #   ProductDependency.connection.schema_cache.clear!
+      # end
+    end
+
+    puts "ĐÃ ROLLBACK THÀNH CÔNG về bàn #{previous_color}"
+    puts "Dữ liệu cũ đã trở lại ngay lập tức!"
+  end
+end
+```
+
 ## Giai đoạn 2: Tích Hợp AI (Vector-Based Search)
 *Mục tiêu: Dùng Nova AI để xử lý dữ liệu phi cấu trúc (Ảnh/Mô tả) mà SQL không làm được.*
 
