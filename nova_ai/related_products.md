@@ -32,20 +32,43 @@ Sample products:
 |5  |Áo thun thể thao Nike Dri-FIT |500,000          |20 (Áo)    |1 (Nike)  |true     |
 |6  |Giày tập gym Reebok Nano      |1,900,000        |10 (Giày)  |4 (Reebok)|true     |
 
-index
+Table:
+```sql
+-- 1. Tạo bảng products
+CREATE TABLE products (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    price DECIMAL(15, 2) DEFAULT 0.0,
+    category_id INTEGER,
+    brand_id INTEGER,
+    is_active BOOLEAN DEFAULT true,
+    image_url VARCHAR(500),
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
+);
+
+-- 2. Index cho việc lọc Metadata (Giai đoạn 1.1)
+-- Giúp tìm nhanh sản phẩm cùng Category và đang Active
+CREATE INDEX index_products_on_category_id_and_is_active
+ON products (category_id, is_active);
+
+-- 3. Index cho việc lọc theo khoảng giá
+-- Kết hợp với category_id để tối ưu các câu query "Related by Price"
+CREATE INDEX index_products_on_price_and_category_id
+ON products (price, category_id);
+
+-- 4. Index hỗ trợ tìm kiếm theo tên (Trường hợp không dùng ES)
+-- Sử dụng gin index với trgm (trigram) nếu bạn muốn search LIKE '%abc%' nhanh hơn
+-- Lưu ý: Cần chạy lệnh 'CREATE EXTENSION IF NOT EXISTS pg_trgm;' trước
+-- CREATE INDEX index_products_on_name_trgm ON products USING gin (name gin_trgm_ops);
+
+-- 5. Index cho thời gian (Để Rake Task lấy hàng mới về hoặc hàng vừa cập nhật)
+-- CREATE INDEX index_products_on_updated_at ON products (updated_at DESC);
+```
+
+Ruby code:
 ```ruby
-class AddIndexesToProductsForRelated < ActiveRecord::Migration
-  def change
-    # Thêm index riêng lẻ (phù hợp nếu bạn hay query riêng rẽ)
-    add_index :products, :category_id
-    add_index :products, :brand_id
-
-    # Mẹo: Nếu THƯỜNG XUYÊN query cả category và brand cùng lúc,
-    # hãy cân nhắc composite index:
-    # add_index :products, [:category_id, :brand_id]
-  end
-end
-
 class Product < ActiveRecord::Base
   # 1. Tìm cùng danh mục
   scope :same_category, ->(category_id) { where(category_id: category_id) }
