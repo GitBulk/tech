@@ -199,6 +199,27 @@ Khi Postgres chạm ngưỡng ~500 triệu - 1 tỷ dòng, việc chạy GROUP B
 
 Install ClickHouse: https://clickhouse.com/docs/getting-started/quick-start/oss
 
+```bash
+# Tải binary native cho Mac M3 (aarch64)
+curl https://clickhouse.com/ | sh
+
+# Kiểm tra binary đã tải xong chưa, ~125MB
+ls -lh clickhouse
+
+# Cài đặt ClickHouse, lệnh này sẽ tạo các thư mục mặc định:
+# /var/lib/clickhouse/ (lưu data), /etc/clickhouse-server/ (config), /var/log/clickhouse-server/
+# Tạo user/group clickhouse nếu cần
+sudo ./clickhouse install
+
+# Chạy foreground
+clickhouse server
+
+# Chạy client
+clickhouse client
+
+# chạy background như service
+sudo clickhouse start
+```
 
 ## 2. Kiến trúc Triển khai (Lab Result)
 Engine: MergeTree (Native Engine mạnh nhất của ClickHouse).
