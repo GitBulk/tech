@@ -99,6 +99,70 @@ split -b 1024m data_90m.csv data_part_
 *   **Ingestion Speed:** ~100 triệu dòng / 2 phút.
     
 
+7\. Dead tuple (đọc thêm)
+-----------------------------------------
+PG dùng cơ chế MVCC (Multi-Version Concurrency Control), cho phép nhiều transaction đọc và ghi đồng thời mà không lock nhau.
+
+Giả sử bảng users
+```sql
+-- Ban đầu
+id | name     | age
+---+----------+-----
+1  | Tran     | 25
+```
+Khi chạy lênh Update
+```sql
+UPDATE users SET age = 26 WHERE id = 1;
+```
+PostgreSQL không sửa trực tiếp dòng cũ. Nó sẽ:
+- Tạo ra một phiên bản mới (new tuple): (id=1, name=Tran, age=26)
+- Đánh dấu phiên bản cũ (age=25) thành Dead Tuple
+
+Khi chạy lệnh Delete
+```sql
+DELETE FROM users WHERE id = 1;
+```
+PostgreSQL cũng không xóa ngay dòng đó, mà chỉ đánh dấu nó là Dead Tuple.
+
+→ Kết quả: Trong file dữ liệu của bảng, vẫn còn tồn tại cả live tuple (phiên bản mới nhất) và dead tuple (phiên bản cũ).
+
+Postgres làm vậy, vì:
+- Để hỗ trợ đọc đồng thời (readers never block writers).
+- Transaction cũ đang chạy có thể vẫn cần thấy phiên bản cũ của dữ liệu.
+- Đảm bảo tính nhất quán (consistency) của transaction.
+
+Hậu quả nếu có quá nhiều Dead Tuples
+- Table bloat (bảng phình to): Chiếm nhiều dung lượng đĩa không cần thiết.
+- Query chậm hơn: Khi scan bảng (seq scan) hoặc dùng index, PostgreSQL phải bỏ qua (skip) rất nhiều dead tuples → tốn thời gian và I/O.
+- Index cũng bị bloat: Index cũng có dead entries tương tự.
+- Tăng nguy cơ transaction ID wraparound (vấn đề nghiêm trọng).
+
+Cách xem số lượng Dead Tuples
+```sql
+-- Xem dead tuples của tất cả tables
+SELECT
+    schemaname,
+    relname,
+    n_live_tup AS live_tuples,
+    n_dead_tup AS dead_tuples,
+    (n_dead_tup * 100.0 / NULLIF(n_live_tup + n_dead_tup, 0)) AS dead_percent
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC;
+```
+Hoặc xem chi tiết một bảng:
+```sql
+SELECT * FROM pgstattuple('ten_bang_cua_ban');
+```
+
+Cách dọn dẹp Dead Tuples:
+- VACUUM ten_bang; → Dọn dead tuples, đánh dấu không gian trống để tái sử dụng (không thu hồi dung lượng đĩa ngay).
+- VACUUM FULL ten_bang; → Dọn sạch và thu hồi dung lượng đĩa thật sự (nhưng khóa bảng, nặng hơn).
+- AUTOVACUUM → PostgreSQL tự động chạy (nên cấu hình tốt).
+
+**Lưu ý:**
+VACUUM thông thường không thu hồi dung lượng đĩa cho hệ điều hành (chỉ đánh dấu để dùng lại). Muốn thu hồi thật phải dùng VACUUM FULL hoặc pg_repack.
+
+
 🚩 Chốt chặn Phase 1
 --------------------
 
