@@ -1,4 +1,4 @@
-name: Auto Create Documentation PR (Gemini Flash Free)
+name: Auto Create Documentation PR
 
 on:
   pull_request:
@@ -17,9 +17,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate Documentation with Gemini 2.5 Flash
+      - name: Generate Content and Filename
         id: generate
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -27,17 +26,37 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          echo "🔄 Đang tạo tài liệu bằng Gemini 2.5 Flash cho PR #${PR_NUMBER}..."
+          echo "🔄 Đang tạo tài liệu bằng AI cho PR #${PR_NUMBER}..."
+          # 1. Tạo JSON payload an toàn bằng jq
+          JSON_PAYLOAD=$(jq -n \
+            --arg prompt "Bạn là technical writer. Viết tài liệu tiếng Việt cho PR #$PR_NUMBER: $PR_TITLE. Mô tả: $PR_BODY. Cấu trúc: Purpose, What Changed, Technical Details. Trả về định dạng Markdown thuần, không bao gồm code block bọc ngoài." \
+            '{contents: [{parts: [{text: $prompt}]}]}')
 
+          # 2. Gọi API Gemini
           response=$(curl -s -X POST \
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$GEMINI_API_KEY" \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d '{
-              "contents": [{
-                "parts":[{
-                  "text": "Bạn là technical writer chuyên nghiệp. Viết tài liệu bằng tiếng Việt cho Pull Request sau.\n\nPR Title: '"${PR_TITLE}"'\nPR Number: #'"${PR_NUMBER}"'\n\nMô tả:\n'"${PR_BODY}"'\n\nHãy tạo file markdown trong thư mục docs/features/.\nTên file: '"${PR_NUMBER}"'-kebab-case-title.md\nViết rõ ràng, ngắn gọn, chuyên nghiệp.\nCấu trúc: Purpose, What Changed, Technical Details, Deployment Notes.\nThêm dòng đầu: Auto-generated from PR #'"${PR_NUMBER}"' - '"${PR_TITLE}"'.\nThêm link về PR gốc."
-                }]
-              }]
-            }')
+            -d "$JSON_PAYLOAD")
 
-          echo "$response" | jq -r '.candidates[0].content.parts[0].text // "Error generating content"' > docs_content.md
+          # 3. Trích xuất nội dung
+          echo "$response" | jq -r '.candidates[0].content.parts[0].text' > content.md
+          
+          # 4. Tạo tên file chuẩn (slugify tiêu đề)
+          FILENAME_TITLE=$(echo "${PR_TITLE}" | iconv -t ascii//TRANSLIT | sed -E 's/[^a-zA-Z0-9]+/-/g' | tr '[:upper:]' '[:lower:]' | sed 's/^-//;s/-$//')
+          FILE_PATH="docs/features/${PR_NUMBER}-${FILENAME_TITLE}.md"
+          
+          mkdir -p docs/features/
+          mv content.md "$FILE_PATH"
+          
+          # Xuất biến để dùng cho step sau
+          echo "file_path=$FILE_PATH" >> $GITHUB_OUTPUT
+
+      - name: Create Pull Request for Docs
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "docs: update documentation for PR #${{ github.event.pull_request.number }}"
+          branch: "docs/pr-${{ github.event.pull_request.number }}"
+          title: "📝 [Docs] Documentation for PR #${{ github.event.pull_request.number }}"
+          body: "Tài liệu này được tạo tự động bởi Gemini Flash từ PR #${{ github.event.pull_request.number }}."
+          base: main
