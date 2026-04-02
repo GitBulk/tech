@@ -200,6 +200,9 @@ Khi Postgres chạm ngưỡng ~500 triệu - 1 tỷ dòng, việc chạy GROUP B
 Install ClickHouse: https://clickhouse.com/docs/getting-started/quick-start/oss
 
 ```bash
+# 1. Tạo thư mục làm việc và tải binary
+mkdir -p ~/clickhouse_platform && cd ~/clickhouse_platform
+
 # Tải binary native cho Mac M3 (aarch64)
 curl https://clickhouse.com/ | sh
 
@@ -211,14 +214,50 @@ ls -lh clickhouse
 # Tạo user/group clickhouse nếu cần
 sudo ./clickhouse install
 
-# Chạy foreground
-clickhouse server
+# config cho clickhouse chạy ngầm trên Macbook
+sudo tee /Library/LaunchDaemons/com.clickhouse-server.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.clickhouse-server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/clickhouse</string>
+        <string>server</string>
+        <string>--config-file=/etc/clickhouse-server/config.xml</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/clickhouse-server/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/clickhouse-server/stderr.log</string>
+</dict>
+</plist>
+EOF
 
-# Chạy client
-clickhouse client
+
+# Phân quyền và Kích hoạt:
+sudo chown root:wheel /Library/LaunchDaemons/com.clickhouse-server.plist
+sudo chmod 644 /Library/LaunchDaemons/com.clickhouse-server.plist
+sudo launchctl load -w /Library/LaunchDaemons/com.clickhouse-server.plist
+
+
+# kiểm tra clickhouse có chạy ngầm ko?
+sudo launchctl list | grep clickhouse
 
 # chạy background như service
 sudo clickhouse start
+
+#Dừng Server
+sudo clickhouse stop
+
+# Chạy client
+clickhouse client
 ```
 
 ## 2. Kiến trúc Triển khai (Lab Result)
