@@ -1,4 +1,4 @@
-name: Auto Create Documentation PR
+name: Auto Create Documentation PR (Gemini 2.5 Flash)
 
 on:
   pull_request:
@@ -7,6 +7,7 @@ on:
 
 jobs:
   create-docs-pr:
+    # Chỉ chạy khi Pull Request thực sự được merge thành công
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     permissions:
@@ -14,49 +15,100 @@ jobs:
       pull-requests: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Generate Content and Filename
+      - name: Generate Documentation with Gemini 2.5 Flash
         id: generate
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          REPO_NAME: ${{ github.repository }}
         run: |
-          echo "🔄 Đang tạo tài liệu bằng AI cho PR #${PR_NUMBER}..."
-          # 1. Tạo JSON payload an toàn bằng jq
-          JSON_PAYLOAD=$(jq -n \
-            --arg prompt "Bạn là technical writer. Viết tài liệu tiếng Việt cho PR #$PR_NUMBER: $PR_TITLE. Mô tả: $PR_BODY. Cấu trúc: Purpose, What Changed, Technical Details. Trả về định dạng Markdown thuần, không bao gồm code block bọc ngoài." \
-            '{contents: [{parts: [{text: $prompt}]}]}')
+          echo "🔄 Đang bắt đầu tạo tài liệu cho PR #${PR_NUMBER}..."
 
-          # 2. Gọi API Gemini
-          response=$(curl -s -X POST \
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$GEMINI_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d "$JSON_PAYLOAD")
-
-          # 3. Trích xuất nội dung
-          echo "$response" | jq -r '.candidates[0].content.parts[0].text' > content.md
+          # 1. Chuẩn bị Prompt (Sử dụng printf để bảo toàn xuống dòng)
+          PROMPT=$(printf "Bạn là một Technical Writer chuyên nghiệp.
+          Hãy viết tài liệu hướng dẫn tính năng (Markdown) bằng tiếng Anh cho Pull Request sau:
           
-          # 4. Tạo tên file chuẩn (slugify tiêu đề)
-          FILENAME_TITLE=$(echo "${PR_TITLE}" | iconv -t ascii//TRANSLIT | sed -E 's/[^a-zA-Z0-9]+/-/g' | tr '[:upper:]' '[:lower:]' | sed 's/^-//;s/-$//')
-          FILE_PATH="docs/features/${PR_NUMBER}-${FILENAME_TITLE}.md"
+          Title: %s
+          Pull Request: #%s
+          Details: %s
+          Reference PR: https://github.com/%s/pull/%s
+          
+          Cấu trúc tài liệu:
+          - Purpose (Mục đích)
+          - What Changed (Những thay đổi chính)
+          - Technical Details (Chi tiết kỹ thuật)
+          - Deployment Notes (Lưu ý triển khai)
+          
+          Yêu cầu: Viết súc tích, chuyên nghiệp. Trả về nội dung Markdown thuần, không bọc trong block code lớn." \
+          "$PR_TITLE" "$PR_NUMBER" "$PR_BODY" "$REPO_NAME" "$PR_NUMBER")
+
+          # 2. Tạo JSON payload bằng jq (Fix lỗi 400 - contents not specified)
+          jq -n --arg msg "$PROMPT" '{contents: [{parts: [{text: $msg}]}]}' > payload.json
+
+          # 3. Cấu hình Model và Retry Logic (Fix lỗi 503)
+          MODEL_NAME="gemini-2.5-flash"
+          MAX_RETRIES=5
+          RETRY_COUNT=0
+          DELAY=10
+          SUCCESS=false
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "📡 Gọi API $MODEL_NAME (Lần thử $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
+            
+            response=$(curl -s -X POST \
+              "https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=$GEMINI_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d @payload.json)
+
+            # Kiểm tra lỗi trong phản hồi
+            ERROR_MSG=$(echo "$response" | jq -r '.error.message // empty')
+            
+            if [ -z "$ERROR_MSG" ]; then
+              CONTENT=$(echo "$response" | jq -r '.candidates[0].content.parts[0].text // empty')
+              if [ -n "$CONTENT" ] && [ "$CONTENT" != "null" ]; then
+                echo "$CONTENT" > docs_content.md
+                SUCCESS=true
+                echo "✅ Thành công!"
+                break
+              fi
+            fi
+
+            echo "⚠️ Lỗi: ${ERROR_MSG:-'Phản hồi trống'}. Thử lại sau ${DELAY}s..."
+            sleep $DELAY
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            DELAY=$((DELAY * 2))
+          done
+
+          if [ "$SUCCESS" = false ]; then
+            echo "❌ Thất bại sau $MAX_RETRIES lần thử."
+            exit 1
+          fi
+
+          # 4. Slugify tiêu đề (Chuyển "Tính Năng Mới" thành "tinh-nang-moi")
+          # Lưu ý: Cần cài đặt iconv (có sẵn trên ubuntu-latest)
+          SLUG=$(echo "${PR_TITLE}" | iconv -f UTF-8 -t ascii//TRANSLIT | sed -E 's/[^a-zA-Z0-9]+/-/g' | tr '[:upper:]' '[:lower:]' | sed 's/^-//;s/-$//')
+          FILE_PATH="docs/features/${PR_NUMBER}-${SLUG}.md"
           
           mkdir -p docs/features/
-          mv content.md "$FILE_PATH"
-          
-          # Xuất biến để dùng cho step sau
+          mv docs_content.md "$FILE_PATH"
           echo "file_path=$FILE_PATH" >> $GITHUB_OUTPUT
 
-      - name: Create Pull Request for Docs
+      - name: Create Pull Request for Documentation
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "docs: update documentation for PR #${{ github.event.pull_request.number }}"
-          branch: "docs/pr-${{ github.event.pull_request.number }}"
-          title: "📝 [Docs] Documentation for PR #${{ github.event.pull_request.number }}"
-          body: "Tài liệu này được tạo tự động bởi Gemini Flash từ PR #${{ github.event.pull_request.number }}."
+          commit-message: "docs: auto-generate documentation for PR #${{ github.event.pull_request.number }}"
+          branch: "docs/update-${{ github.event.pull_request.number }}"
+          title: "📝 [Tài liệu] PR #${{ github.event.pull_request.number }} - ${{ github.event.pull_request.title }}"
+          body: |
+            Tài liệu này được tạo tự động bởi **Gemini 2.5 Flash** dựa trên nội dung PR #${{ github.event.pull_request.number }}.
+            Vui lòng kiểm tra lại trước khi merge.
+          labels: "documentation, ai-generated"
           base: main
