@@ -1,0 +1,43 @@
+name: Auto Create Documentation PR (Gemini Flash Free)
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main, master]
+
+jobs:
+  create-docs-pr:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Documentation with Gemini 2.5 Flash
+        id: generate
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          echo "🔄 Đang tạo tài liệu bằng Gemini 2.5 Flash cho PR #${PR_NUMBER}..."
+
+          response=$(curl -s -X POST \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "contents": [{
+                "parts":[{
+                  "text": "Bạn là technical writer chuyên nghiệp. Viết tài liệu bằng tiếng Việt cho Pull Request sau.\n\nPR Title: '"${PR_TITLE}"'\nPR Number: #'"${PR_NUMBER}"'\n\nMô tả:\n'"${PR_BODY}"'\n\nHãy tạo file markdown trong thư mục docs/features/.\nTên file: '"${PR_NUMBER}"'-kebab-case-title.md\nViết rõ ràng, ngắn gọn, chuyên nghiệp.\nCấu trúc: Purpose, What Changed, Technical Details, Deployment Notes.\nThêm dòng đầu: Auto-generated from PR #'"${PR_NUMBER}"' - '"${PR_TITLE}"'.\nThêm link về PR gốc."
+                }]
+              }]
+            }')
+
+          echo "$response" | jq -r '.candidates[0].content.parts[0].text // "Error generating content"' > docs_content.md
