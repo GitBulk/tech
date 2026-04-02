@@ -49,31 +49,31 @@ jobs:
 
           echo "📝 Đang chuẩn bị yêu cầu gửi cho Gemini..."
 
-          # 2. Xây dựng Prompt ép AI phải phân tích Code thay vì chỉ dựa vào mô tả của Dev
-          PROMPT=$(printf "Bạn là một chuyên gia Technical Writer cấp cao. 
-          Nhiệm vụ: Phân tích nội dung Code Diff thực tế bên dưới để viết tài liệu tính năng (Markdown) bằng tiếng Anh.
-          Lưu ý: Nếu phần mô tả của Developer sơ sài (như 'fix bug', 'update layout'), bạn PHẢI dựa vào Code Diff để tự suy luận mục đích và thay đổi kỹ thuật.
-
+          # 2. Xây dựng Prompt (Sử dụng biến môi trường trực tiếp để an toàn hơn printf)
+          # AI sẽ đọc nội dung template bạn điền trong PR_BODY và đối chiếu với DIFF_CONTENT
+          PROMPT="Bạn là một chuyên gia Technical Writer cấp cao. 
+          Nhiệm vụ: Phân tích nội dung Code Diff thực tế bên dưới kết hợp với mô tả của Developer để viết tài liệu tính năng (Markdown) bằng tiếng Anh.
+          
           ### THÔNG TIN PULL REQUEST
-          - Tiêu đề: %s
-          - Số hiệu: #%s
-          - Mô tả từ Developer: %s
+          - Tiêu đề: $PR_TITLE
+          - Số hiệu: #$PR_NUMBER
+          - Nội dung từ Template PR:
+          $PR_BODY
 
-          ### CODE DIFF THAY ĐỔI (ĐỌC KỸ ĐỂ VIẾT CHI TIẾT KỸ THUẬT)
-          %s
+          ### CODE DIFF THAY ĐỔI (DỰA VÀO ĐÂY ĐỂ VIẾT CHI TIẾT KỸ THUẬT)
+          $DIFF_CONTENT
 
-          ### YÊU CẦU CẤU TRÚC TÀI LIỆU (Markdown)
-          - Dòng đầu file: Auto-generated from PR #%s - %s
-          - Link ngược về PR: https://github.com/%s/pull/%s
+          ### YÊU CẦU CẤU TRÚC TÀI LIỆU
+          - Dòng đầu file: Auto-generated from PR #$PR_NUMBER - $PR_TITLE
+          - Link ngược về PR: https://github.com/$REPO_NAME/pull/$PR_NUMBER
           - Nội dung bao gồm các phần:
             ## 🎯 Purpose (Mục đích)
             ## ✨ What Changed (Những thay đổi chính)
-            ## ⚙️ Technical Details (Chi tiết kỹ thuật - Phân tích từ code)
+            ## ⚙️ Technical Details (Chi tiết kỹ thuật - Phân tích sâu từ code diff)
             ## 🚀 Deployment/Migration Notes (Lưu ý triển khai)
             ## ⚠️ Risks (Rủi ro nếu có)
 
-          Yêu cầu: Viết chuyên nghiệp, súc tích. Trả về Markdown thuần, không bọc trong block code lớn." \
-          "$PR_TITLE" "$PR_NUMBER" "${PR_BODY:-'Không có mô tả'}" "$DIFF_CONTENT" "$PR_NUMBER" "$PR_TITLE" "$REPO_NAME" "$PR_NUMBER")
+          Yêu cầu: Viết chuyên nghiệp, súc tích. Trả về Markdown thuần, không bọc trong block code lớn."
 
           # 3. Tạo JSON payload an toàn bằng jq
           jq -n --arg msg "$PROMPT" '{contents: [{parts: [{text: $msg}]}]}' > payload.json
@@ -108,18 +108,16 @@ jobs:
           fi
 
           # 5. Xử lý tên file (Chuyển "Tính năng mới" -> "tinh-nang-moi")
-          # Sử dụng sed để làm sạch ký tự đặc biệt và giữ lại chữ cái/số
           CLEAN_TITLE=$(echo "${PR_TITLE}" | sed 's/[^a-zA-Z0-9 ]//g' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | cut -c1-50)
           FILE_PATH="docs/features/${PR_NUMBER}-${CLEAN_TITLE}.md"
           
           mkdir -p docs/features/
           mv docs_content.md "$FILE_PATH"
           
-          # 6. Dọn dẹp file tạm để không bị commit vào PR
+          # 6. Dọn dẹp file tạm
           rm payload.json changes.diff
           
           echo "file_path=$FILE_PATH" >> $GITHUB_OUTPUT
-          echo "🚀 File tài liệu đã sẵn sàng tại: $FILE_PATH"
 
       - name: Create Pull Request for Documentation
         uses: peter-evans/create-pull-request@v6
@@ -132,9 +130,8 @@ jobs:
           body: |
             Tài liệu này được tạo tự động bởi **Gemini 2.5 Flash** cho PR #${{ github.event.pull_request.number }}.
             
-            **Tính năng:**
-            - Phân tích trực tiếp từ Code Diff thực tế (phòng trường hợp Developer viết mô tả sơ sài).
-            - Tự động tạo file tài liệu trong thư mục `docs/features/`.
-            - Vui lòng kiểm tra lại tính chính xác trước khi merge.
+            **Phân tích:**
+            - Kết hợp thông tin từ PR Template và Code Diff thực tế.
+            - Tự động tạo file trong `docs/features/`.
           labels: "documentation, ai-generated"
           base: main
