@@ -299,3 +299,76 @@ Storage Strategy:
 - Aggregated Data: ClickHouse AggregatingMergeTree (Báo cáo Dashboard).
 - Cold Data (Phase 3): Parquet trên MinIO (Lưu trữ vĩnh viễn).
 
+
+🌊 Phase 3: Data Lake (S3 + Parquet) (tiếp tục ở đây)
+===================================================
+Dữ liệu 100 tỷ dòng sau 1-2 năm sẽ trở thành "dữ liệu lạnh" (Cold data). Lưu trữ mãi trên SSD của ClickHouse/Postgres là một sự lãng phí ngân sách (Not budget-conscious).
+- Chuyển đổi: Export dữ liệu cũ sang định dạng Apache Parquet.
+- Lưu trữ: Đẩy lên S3 (hoặc MinIO nếu bạn muốn tự host).
+- Hiệu quả: Chi phí lưu trữ giảm 10-20 lần so với chạy DB.
+
+```bash
+
+# Tải bản Native ARM cho chip M-series
+curl https://dl.min.io/server/minio/release/darwin-arm64/minio --output minio
+
+# Cấp quyền thực thi
+chmod +x minio
+
+# Di chuyển vào thư mục bin hệ thống để gọi từ đâu cũng được
+sudo mv minio /usr/local/bin/
+
+# Kiểm tra
+minio --version
+
+# Tải bản mc (tức minio client cho console) cho Apple Silicon
+curl https://dl.min.io/client/mc/release/darwin-arm64/mc --output mc
+
+# Cấp quyền thực thi
+chmod +x mc
+
+# Đưa vào "hàng ngũ" cùng với minio server
+sudo mv mc /usr/local/bin/
+
+# Kiểm tra thành quả
+mc --version
+
+# tạo folder nơi chứ data cho minio (có thể dùng tên khác)
+mkdir -p ~/minio_data
+
+
+# Vì minio và clickhouse đụng port 9000 nên ta cần sửa port của minio server
+# thành 9002 để các lệnh bằng python, ruby, clickhouse, ... có thể giáo tiếp được
+# còn phần dashboard admin của minio vẫn dùng port 9001
+# thêm dòng alias bên dưới vào file ~/.bash_profile, sau đó gõ source ~/.bash_profile để cập nhật
+alias minio_server='minio server ~/minio_data --address ":9002" --console-address ":9001"'
+
+# từ bây giờ, ta dùng alias vừa tạo để start minio server, gõ lệnh
+minio_server
+
+# gắn minio_data vào minio server
+minio server ~/minio_data --console-address ":9001"
+
+# tạo 1 alias cho minio server, vd alias tên là nova-lake
+# dùng minio client để tạo alias
+mc alias set nova-lake http://localhost:9002 minioadmin minioadmin
+
+# xem info các alias
+mc alias list
+
+# tạo bucket, vd tên bucket minio-bucket
+# C1: truy cập localhost:9001, tạo thử 1 bucket
+# C2: gõ lệnh, cú pháp `mc mb alias_name/bucket_name`
+mc mb nova-lake/minio-bucket
+
+# liệt kê file trong bucket
+mc ls nova-lake/minio-bucket
+
+# copy file vào bucket
+mc cp "/Users/mingle/Documents/test data.txt" nova-lake/minio-bucket
+
+# kiểm tra các named collection, trong clickhouse client
+SELECT name, create_query
+FROM system.named_collections
+WHERE name = 'minio_lab';
+```
