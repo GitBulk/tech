@@ -299,3 +299,5 @@ Storage Strategy:
 - Aggregated Data: ClickHouse AggregatingMergeTree (Báo cáo Dashboard).
 - Cold Data (Phase 3): Parquet trên MinIO (Lưu trữ vĩnh viễn).
 
+## 6. Pipeline
+Thiết kế Pipeline Sync ClickHouse và Postgres, xem [Pipeline Doc](https://github.com/mingle/techblog/blob/main/tech/pipeline_pg_clickhouse.md)
