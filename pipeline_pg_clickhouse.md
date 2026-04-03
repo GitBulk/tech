@@ -386,6 +386,52 @@ Nhược điểm:
 
 # 11. Hướng phát triển (V2)
 
+Mô hình dự kiến
+```
+        ┌────────────────────┐
+        │   Rails App        │
+        │  (OLTP + API)      │
+        └────────┬───────────┘
+                 │
+                 ▼
+        ┌────────────────────┐
+        │   PostgreSQL       │
+        │ (source of truth)  │
+        └────────┬───────────┘
+                 │
+        CDC (WAL stream)
+                 │
+                 ▼
+        ┌────────────────────┐
+        │     Kafka          │
+        │  (event stream)    │
+        └────────┬───────────┘
+                 │
+     ┌───────────┴───────────┐
+     ▼                       ▼
+┌──────────────┐     ┌────────────────────┐
+│ ClickHouse   │     │ Other consumers    │
+│ Kafka Engine │     │ (optional)         │
+└──────┬───────┘     └────────────────────┘
+       │
+       ▼
+┌────────────────────┐
+│ ClickHouse RAW     │
+│ order_items_flat   │
+└────────┬───────────┘
+         │
+   ┌─────┴─────┐
+   ▼           ▼
+Materialized   Batch Jobs
+Views          (cohort)
+   ▼           ▼
+┌────────────────────┐
+│ Report Tables      │
+└────────┬───────────┘
+         ▼
+   Dashboard / BI
+```
+
 ## 11.1 Pipeline push bằng Kafka
 
 Thay pull bằng event streaming:
