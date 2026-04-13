@@ -317,7 +317,23 @@ end
 
 - Trong thực tế vận hành ở quy mô lớn, những rủi ro và chi phí vận hành này khiến distributed lock trở thành một giải pháp không hoàn toàn lý tưởng. Vì vậy, nhiều hệ thống hiện đại đã chuyển sang các kỹ thuật lock-free như Probabilistic Early Expiration, cho phép giảm đáng kể nguy cơ cache stampede mà không cần dựa vào cơ chế distributed lock phức tạp.
 
-- Chỉ nên dùng distributed lock với Redis cho trường hợp efficiency lock như: cache rebuild, cron dedup, background job, vì trong trường hợp xấu nhất chỉ là duplicate work. Còn đối với hệ thống cần correctness lock (KHÔNG nên dùng Redis) như: bank transfer, inventory deduction, distributed transaction thì nên dùng consensus system
+- Distributed lock trong Redis chỉ cung cấp cơ chế phối hợp (coordination) ở mức best-effort, không đảm bảo tính nhất quán mạnh (strong consistency). Áp dụng khi mục tiêu là tối ưu hiệu năng, và trong trường hợp xấu nhất chỉ gây ra duplicate work:
+  - Cache rebuild (tránh nhiều request cùng recompute)
+  - Cron job deduplication
+  - Background job coordination
+
+- Không sử dụng Redis distributed lock cho các nghiệp vụ yêu cầu tính chính xác tuyệt đối, vì lỗi lock có thể dẫn đến → mất tiền, sai dữ liệu, hoặc vi phạm tính toàn vẹn hệ thống:
+  - Bank transfer
+  - Inventory deduction
+  - Distributed transaction
+
+- Khi đó, giải pháp phù hợp hơn:
+  - Sử dụng consensus system (etcd, ZooKeeper, Consul) nếu cần lock mạnh
+  - Sử dụng idempotency để chống duplicate request
+  - Sử dụng Saga pattern để xử lý failure trong distributed system
+
+- Không dùng lock để đảm bảo correctness cho các side-effect bên ngoài hệ thống.
+Thay vào đó, sử dụng idempotency và cơ chế bù trừ (compensation).
 
 `Các Gem nổi tiếng`
 - redlock-rb (implement Redlock algorithm)
@@ -676,6 +692,8 @@ class V2::EphemeralCoalescer
     data = parsing_cache(cached)
 
     if data.nil? || should_recompute?(data)
+      # TODO: future implementation, trong case should_recompute thì data có đi cập nhật cache dưới background
+
       begin
         # FETCH MỚI & LƯU L2 (Nếu Redis trống hoặc trúng xác suất tính sớm)
         start_t = Time.now.to_f
