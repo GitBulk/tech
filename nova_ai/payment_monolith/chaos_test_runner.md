@@ -79,19 +79,20 @@ faker
 5\. scenarios.py (Chaos Scenarios)
 ==================================
 ```python
+import hashlib
+import hmac
+import json
+import os
+import random
 import threading
 import time
-import requests
-import random
 import uuid
-import os
+
+import requests
 
 TARGET_URL = os.getenv("TARGET_URL")
-
-HEADERS = {
-    "Content-Type": "application/json",
-    "X-Signature": "test-signature"
-}
+# EXTERNAL: phải match với secret key được cấu hình trên Rails server (ENV["VNPAY_SECRET"])
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "test-secret")
 
 def generate_payload(transaction_id):
     return {
@@ -101,13 +102,29 @@ def generate_payload(transaction_id):
         "status": "success"
     }
 
+def sign_payload(payload):
+    sorted_items = sorted(payload.items())
+    raw = "&".join(f"{k}={v}" for k, v in sorted_items)
+    signature = hmac.new(
+        WEBHOOK_SECRET.encode("utf-8"),
+        raw.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+    return signature
+
+def build_headers(payload):
+    return {
+        "Content-Type": "application/json",
+        "X-Signature": sign_payload(payload)
+    }
+
 # --- Scenario A: Duplicate Storm ---
 def duplicate_storm(n=100):
     tx_id = f"TXN_{uuid.uuid4()}"
 
     def send():
         payload = generate_payload(tx_id)
-        requests.post(TARGET_URL, json=payload, headers=HEADERS)
+        requests.post(TARGET_URL, json=payload, headers=build_headers(payload))
 
     threads = []
     for _ in range(n):
@@ -128,26 +145,30 @@ def retry_storm(duration=10):
 
     while time.time() - start < duration:
         payload = generate_payload(tx_id)
-        requests.post(TARGET_URL, json=payload, headers=HEADERS)
+        requests.post(TARGET_URL, json=payload, headers=build_headers(payload))
         time.sleep(0.05)
 
     print(f"[retry_storm] ran for {duration}s on {tx_id}")
 
 # --- Scenario C: Out-of-order ---
+# Dùng 2 transaction_id khác nhau cho 2 attempt (FAILED → SUCCESS) vì unique
+# constraint chặn cùng transaction_id. Đây đúng với thực tế: provider retry
+# cùng tx_id cho cùng attempt, còn attempt mới sẽ có tx_id mới.
 def out_of_order():
-    tx_id = f"TXN_{uuid.uuid4()}"
+    failed_tx_id = f"TXN_FAIL_{uuid.uuid4()}"
+    success_tx_id = f"TXN_OK_{uuid.uuid4()}"
 
-    failed_payload = generate_payload(tx_id)
+    failed_payload = generate_payload(failed_tx_id)
     failed_payload["status"] = "failed"
 
-    success_payload = generate_payload(tx_id)
+    success_payload = generate_payload(success_tx_id)
     success_payload["status"] = "success"
 
     requests.post(TARGET_URL, json=failed_payload, headers=HEADERS)
     time.sleep(0.1)
     requests.post(TARGET_URL, json=success_payload, headers=HEADERS)
 
-    print(f"[out_of_order] executed for {tx_id}")
+    print(f"[out_of_order] executed: failed={failed_tx_id}, success={success_tx_id}")
 
 # --- Scenario D: Mixed Chaos ---
 def mixed_chaos():
@@ -163,7 +184,7 @@ def mixed_chaos():
         if random.random() < 0.3:
             payload["status"] = "failed"
 
-        requests.post(TARGET_URL, json=payload, headers=HEADERS)
+        requests.post(TARGET_URL, json=payload, headers=build_headers(payload))
 
     threads = []
     for _ in range(50):

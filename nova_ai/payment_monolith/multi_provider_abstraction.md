@@ -176,7 +176,8 @@ module Payments
 
         expected = OpenSSL::HMAC.hexdigest("SHA256", @config[:secret], raw)
 
-        signature == expected
+        # SECURITY: dùng secure_compare để tránh timing attack
+        ActiveSupport::SecurityUtils.secure_compare(signature, expected)
       end
 
       def parse_webhook(payload:)
@@ -271,6 +272,8 @@ module Payments
 
       verify!(adapter)
 
+      record_event!
+
       event = adapter.parse_webhook(payload: @payload)
 
       Payments::ProcessNormalizedEvent.new(event: event).call
@@ -285,6 +288,15 @@ module Payments
       )
 
       raise InvalidSignatureError unless valid
+    end
+
+    def record_event!
+      PaymentEvent.create!(
+        provider: @provider,
+        transaction_id: @payload["transaction_id"] || @payload["transId"],
+        event_type: "webhook",
+        payload: @payload
+      )
     end
   end
 end
@@ -303,15 +315,20 @@ module Payments
     end
 
     def call
-      ActiveRecord::Base.transaction do
+      payment, order = ActiveRecord::Base.transaction do
         payment = create_payment!
-
-        return :duplicate unless payment.persisted?
 
         order = Order.lock.find(@event.order_id)
 
         handle_event(order, payment)
+
+        [payment, order]
       end
+
+      # ORDER: emit sau khi transaction commit, tránh job chạy trước khi DB ghi xong
+      emit_side_effects(payment, order) if @event.status == "SUCCESS"
+
+      :ok
     rescue ActiveRecord::RecordNotUnique
       :duplicate
     end
@@ -351,6 +368,13 @@ module Payments
 
       order.update!(status: "FAILED")
       payment.update!(status: "FAILED")
+    end
+
+    def emit_side_effects(payment, order)
+      Payments::DispatchSideEffectsJob.perform_later(
+        payment_id: payment.id,
+        order_id: order.id
+      )
     end
   end
 end

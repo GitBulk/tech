@@ -1,5 +1,10 @@
 Service layer code bám sát: idempotent, transaction-safe, webhook-driven, không phụ thuộc Redis để đảm bảo correctness.
 
+> **Single-provider vs Multi-provider:**
+> - `ProcessWebhook` (file này) — dùng cho hệ thống **single-provider** (1 provider duy nhất).
+> - `ProcessWebhookV2` (`multi_provider_abstraction.md`) — dùng khi cần hỗ trợ **nhiều provider** (VNPay, Momo, Stripe…).
+> - Hai class không dùng song song. Chọn một và dùng nhất quán toàn hệ thống.
+
 
 1\. Service Overview
 ====================
@@ -78,7 +83,7 @@ module Payments
     end
 
     def call
-      ActiveRecord::Base.transaction do
+      payment, order = ActiveRecord::Base.transaction do
         payment = create_payment_record!
 
         order = lock_order!(payment.order_id)
@@ -87,8 +92,11 @@ module Payments
 
         mark_payment_success!(payment)
 
-        emit_side_effects(payment, order)
+        [payment, order]
       end
+
+      # ORDER: emit sau khi transaction commit, tránh job chạy trước khi DB ghi xong
+      emit_side_effects(payment, order)
 
       :ok
     rescue ActiveRecord::RecordNotUnique

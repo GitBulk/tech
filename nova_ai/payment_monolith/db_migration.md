@@ -41,6 +41,7 @@ CREATE TABLE orders (
     currency VARCHAR(10) NOT NULL DEFAULT 'VND',
     status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
     -- PENDING | PROCESSING (optional) | PAID | FAILED | EXPIRED
+    idempotency_key VARCHAR(255),
     version INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT now(),
     updated_at TIMESTAMP NOT NULL DEFAULT now()
@@ -51,6 +52,7 @@ CREATE TABLE orders (
 ```sql
 CREATE INDEX idx_orders_user_id ON orders(user_id);
 CREATE INDEX idx_orders_status ON orders(status);
+CREATE UNIQUE INDEX uniq_orders_idempotency_key ON orders(idempotency_key) WHERE idempotency_key IS NOT NULL;
 ```
 * * * * *
 
@@ -106,10 +108,11 @@ ON payment_events(transaction_id);
 class CreatePaymentSystem < ActiveRecord::Migration[7.0]
   def change
     create_table :orders do |t|
-      t.bigint :user_id, null: false\
-      t.bigint :amount, null: false\
+      t.bigint :user_id, null: false
+      t.bigint :amount, null: false
       t.string :currency, null: false, default: "VND"
       t.string :status, null: false, default: "PENDING"
+      t.string :idempotency_key
       t.integer :version, null: false, default: 0
 
       t.timestamps
@@ -117,6 +120,10 @@ class CreatePaymentSystem < ActiveRecord::Migration[7.0]
 
     add_index :orders, :user_id
     add_index :orders, :status
+    add_index :orders, :idempotency_key,
+              unique: true,
+              where: "idempotency_key IS NOT NULL",
+              name: "uniq_orders_idempotency_key"
 
     create_table :payments do |t|
       t.references :order, null: false, foreign_key: true
