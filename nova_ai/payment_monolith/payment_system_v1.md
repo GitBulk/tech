@@ -26,7 +26,7 @@ Mục tiêu là tạo đơn và hướng dẫn User đi thanh toán.
     > **Lưu ý:** Tại bước này, bạn **chưa được** cập nhật đơn hàng là thành công trong DB. Chỉ hiển thị thông báo: "Chúng tôi đang kiểm tra giao dịch của bạn".
 
 
-**Luồng 2: Server của bạn $\leftrightarrow$ Server đối tác (IPN/Webhook):**
+**Luồng 2: Server của bạn ↔ Server đối tác (IPN/Webhook):**
 
 Đây là luồng dữ liệu (Data Integrity). Đây mới là nơi "tiền thực sự về túi".
 
@@ -150,7 +150,7 @@ Logic của Redlock Client sẽ hoạt động như sau:
 Dù có 5 node Master, Redlock vẫn bị các chuyên gia (như Martin Kleppmann) chỉ ra những lỗ hổng và kỹ thuật sau:
 - **Clock Drift (Lệch đồng hồ):** Redlock dựa trên giả định rằng thời gian trôi qua trên 5 máy là như nhau. Nếu Node A có đồng hồ chạy nhanh hơn Node B, nó có thể hết hạn (expire) key sớm hơn, dẫn đến việc một client khác nhảy vào chiếm node đó trong khi bạn vẫn nghĩ mình đang giữ lock.
 
-- **Process Pause (Stop-the-world GC):** Nếu code Python/Java của bạn bị treo (GC) ngay sau khi lấy được lock ở 3 node, nhưng trước khi kịp ghi vào DB. Trong lúc code bạn bị treo, lock hết hạn ở Redis, một worker khác nhảy vào chiếm lock và ghi DB thành công. Khi code bạn "tỉnh dậy", nó cứ thế ghi tiếp $\rightarrow$ Duplicate Data.
+- **Process Pause (Stop-the-world GC):** Nếu code Python/Java của bạn bị treo (GC) ngay sau khi lấy được lock ở 3 node, nhưng trước khi kịp ghi vào DB. Trong lúc code bạn bị treo, lock hết hạn ở Redis, một worker khác nhảy vào chiếm lock và ghi DB thành công. Khi code bạn "tỉnh dậy", nó cứ thế ghi tiếp → Duplicate Data.
 
 Sample Code Redlock:
 ```python
@@ -166,6 +166,23 @@ REDIS_NODES = [
     redis.StrictRedis(host='redis-5', port=6379),
 ]
 
+# WORKAROUND: unlock phải dùng Lua script để đảm bảo atomic check-and-delete,
+# tránh xóa nhầm lock của worker khác đang giữ hợp lệ
+UNLOCK_SCRIPT = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+"""
+
+def release_redlock(resource_name, value):
+    for node in REDIS_NODES:
+        try:
+            node.eval(UNLOCK_SCRIPT, 1, resource_name, value)
+        except Exception:
+            pass  # Node down — bỏ qua, TTL sẽ tự expire
+
 def acquire_redlock(resource_name, value, ttl_ms=10000):
     start_time = time.time() * 1000
     n_acquired = 0
@@ -180,9 +197,8 @@ def acquire_redlock(resource_name, value, ttl_ms=10000):
     if n_acquired >= 3 and elapsed_time < ttl_ms:
         return True
     else:
-        # Nếu thua, phải đi xóa (unlock) ở tất cả các node đã lỡ chiếm
-        for node in REDIS_NODES:
-            node.delete(resource_name)
+        # Nếu thua, release an toàn bằng Lua script (check value trước khi xóa)
+        release_redlock(resource_name, value)
         return False
 ```
 Dựng 5 Master chỉ giải quyết được bài toán **Sẵn sàng (Availability)** của chính cụm Redis. Nó không giải quyết triệt để bài toán **Tính đúng đắn (Correctness)** nếu giữa ứng dụng và DB xảy ra hiện tượng trễ mạng hoặc treo tiến trình.

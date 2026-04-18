@@ -199,28 +199,35 @@ orders.status == "PAID"
 
 ### Description
 
-FAILED đến trước SUCCESS
+Attempt đầu FAILED (tx_id mới), attempt sau SUCCESS (tx_id khác).
+Mỗi attempt có `transaction_id` riêng — đúng với hành vi thực tế của VNPay/Momo.
+
+> **Lưu ý:** Không dùng cùng `transaction_id` cho cả FAILED lẫn SUCCESS —
+> unique constraint sẽ chặn attempt thứ 2, không phải out-of-order thật sự.
 
 * * * * *
 
 ### Injection
 
 Send:
-1. FAILED webhook
-2. SUCCESS webhook
+1. FAILED webhook (`transaction_id = TXN_FAIL_xxx`)
+2. SUCCESS webhook (`transaction_id = TXN_OK_yyy`, cùng `order_id`)
 
 * * * * *
 
 ### Expected Result
 
 -   Final state phải là:
-    -   PAID (SUCCESS thắng)
+    -   PAID (SUCCESS thắng, state machine guard bảo vệ không flip ngược lại)
 
 * * * * *
 
 ### Assertions
 
+```
 orders.status == "PAID"
+COUNT(payments WHERE order_id = 1001) == 2  -- 1 FAILED + 1 SUCCESS
+```
 
 * * * * *
 

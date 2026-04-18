@@ -67,6 +67,12 @@ module Payments
       def parse_webhook(payload:)
         raise NotImplementedError
       end
+
+      # Fetch transactions từ provider API theo ngày — dùng cho reconciliation job
+      # Returns: Array of Struct/OpenStruct với fields: transaction_id, order_id, amount, currency, status, raw
+      def fetch_transactions(date:)
+        raise NotImplementedError
+      end
     end
   end
 end
@@ -331,6 +337,9 @@ module Payments
       :ok
     rescue ActiveRecord::RecordNotUnique
       :duplicate
+    rescue ActiveRecord::RecordNotFound
+      Rails.logger.error("[ProcessNormalizedEvent] order not found: order_id=#{@event.order_id}")
+      :order_not_found
     end
 
     private

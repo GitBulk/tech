@@ -88,7 +88,10 @@ module Payments
 
         order = lock_order!(payment.order_id)
 
-        return :invalid_state unless process_order!(order)
+        unless process_order!(order)
+          payment.update!(status: "FAILED")
+          return :invalid_state
+        end
 
         mark_payment_success!(payment)
 
@@ -100,8 +103,11 @@ module Payments
 
       :ok
     rescue ActiveRecord::RecordNotUnique
-      # Idempotency hit
       :already_processed
+    rescue ActiveRecord::RecordNotFound
+      # Provider gửi order_id không tồn tại — log và từ chối, không retry
+      Rails.logger.error("[ProcessTransaction] order not found: #{@payload.slice("order_id")}")
+      :order_not_found
     end
 
     private
@@ -383,6 +389,47 @@ Có thể thêm:
 -   Saga orchestration
 
 * * * * *
+
+11\. Migration Guide: v1 → v2 (Multi-Provider)
+==============================================
+
+Khi cần hỗ trợ nhiều provider (VNPay + Momo + Stripe...), migrate từ `ProcessWebhook` (v1) sang `ProcessWebhookV2` theo 4 bước:
+
+### Bước 1: Tạo adapter cho từng provider
+
+Tạo class kế thừa `BaseAdapter` trong `app/services/payments/providers/`:
+```
+VnpayAdapter   ← đã có mẫu trong multi_provider_abstraction.md
+MomoAdapter    ← đã có mẫu
+NewAdapter     ← thêm provider mới tại đây
+```
+
+### Bước 2: Đăng ký vào ProviderFactory
+
+```ruby
+# app/services/payments/provider_factory.rb
+case provider
+when "vnpay" then Providers::VnpayAdapter.new(config: config)
+when "momo"  then Providers::MomoAdapter.new(config: config)
+when "new"   then Providers::NewAdapter.new(config: config)
+```
+
+### Bước 3: Đổi controller sang dùng ProcessWebhookV2
+
+```ruby
+# app/controllers/webhooks/payments_controller.rb
+# TRƯỚC (v1 — single provider):
+Payments::ProcessWebhook.new(provider:, payload:, headers:).call
+
+# SAU (v2 — multi-provider):
+Payments::ProcessWebhookV2.new(provider:, payload:, headers:).call
+```
+
+### Bước 4: Xóa ProcessWebhook (v1) sau khi verify v2 chạy ổn
+
+Không giữ cả 2 song song — chọn một và dùng nhất quán.
+
+---
 
 Kết luận
 ========

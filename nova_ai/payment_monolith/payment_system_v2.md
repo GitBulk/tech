@@ -472,25 +472,100 @@ end
 
 ### 14.1 Reconciliation job (daily)
 
-### Cách làm:
+Cron job chạy mỗi ngày — last safety net khi webhook miss hoặc fail.
 
--   Cron job mỗi ngày:
-```
-fetch transactions từ provider API
-compare với DB
-```
+**3 trường hợp cần xử lý:**
 
-### Pseudo:
+| Case | Nghĩa | Hành động |
+| --- | --- | --- |
+| Có trong provider, không có trong DB | Webhook miss hoàn toàn | Tạo payment + update order |
+| Có trong cả 2, nhưng status lệch | Webhook đến nhưng xử lý lỗi | Fix status + alert |
+| Có trong DB, không có trong provider | Data lạ / bug | Alert để điều tra |
+
 ```ruby
-provider_txns.each do |txn|
-  local = Payment.find_by(transaction_id: txn.id)
-  if local.nil?
-    # missing → create or alert
-  elsif local.status != txn.status
-    # mismatch → fix / alert
+# app/jobs/payments/reconciliation_job.rb
+module Payments
+  class ReconciliationJob < ApplicationJob
+    queue_as :low
+
+    def perform(provider:, date: Date.yesterday)
+      adapter = ProviderFactory.build(provider)
+
+      # Lấy danh sách transactions từ provider trong ngày
+      provider_txns = adapter.fetch_transactions(date: date)
+
+      provider_txns.each do |txn|
+        reconcile_transaction(provider, txn)
+      end
+    end
+
+    private
+
+    def reconcile_transaction(provider, txn)
+      local = Payment.find_by(provider: provider, transaction_id: txn.transaction_id)
+
+      if local.nil?
+        # EXTERNAL: webhook miss — tạo lại từ provider data
+        Rails.logger.warn("[Reconciliation] missing payment: #{txn.transaction_id}")
+        reprocess(provider, txn)
+
+      elsif local.status != txn.status
+        Rails.logger.warn("[Reconciliation] status mismatch: #{txn.transaction_id} local=#{local.status} provider=#{txn.status}")
+        fix_mismatch(local, txn)
+
+      end
+    end
+
+    def reprocess(provider, txn)
+      # Tái tạo NormalizedEvent từ provider data rồi chạy qua core processor
+      event = Payments::NormalizedEvent.new(
+        provider: provider,
+        event_type: "reconciliation",
+        transaction_id: txn.transaction_id,
+        order_id: txn.order_id,
+        amount: txn.amount,
+        currency: txn.currency,
+        status: txn.status,
+        raw_payload: txn.raw
+      )
+
+      Payments::ProcessNormalizedEvent.new(event: event).call
+    end
+
+    def fix_mismatch(local, txn)
+      return unless txn.status == "SUCCESS" && local.status != "SUCCESS"
+
+      # Chỉ fix theo hướng SUCCESS — không downgrade từ SUCCESS xuống FAILED
+      Payments::ProcessNormalizedEvent.new(
+        event: Payments::NormalizedEvent.new(
+          provider: local.provider,
+          event_type: "reconciliation",
+          transaction_id: local.transaction_id,
+          order_id: local.order_id,
+          amount: local.amount,
+          currency: local.currency,
+          status: "SUCCESS",
+          raw_payload: local.raw_payload
+        )
+      ).call
+    end
   end
 end
 ```
+
+**Schedule (cron):**
+```ruby
+# config/schedule.rb (whenever gem) hoặc Sidekiq-Cron
+every 1.day, at: "2:00 am" do
+  runner "Payments::ReconciliationJob.perform_later(provider: 'vnpay')"
+  runner "Payments::ReconciliationJob.perform_later(provider: 'momo')"
+end
+```
+
+**Lưu ý quan trọng:**
+- `reprocess` và `fix_mismatch` đều đi qua `ProcessNormalizedEvent` — **idempotent by design**, chạy lại nhiều lần không bị double charge
+- Chỉ fix theo hướng SUCCESS, không bao giờ downgrade từ PAID → FAILED qua reconciliation
+- Adapter cần implement thêm `fetch_transactions(date:)` — mỗi provider có API riêng
 
 👉 Đây là **last safety net**
 
